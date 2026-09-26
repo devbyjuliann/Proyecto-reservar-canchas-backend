@@ -1,0 +1,31 @@
+{
+  "name": "reserva-canchas-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0 <25.0.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --env-file-if-exists=.env.test.local --test",
+    "test:unit": "node --test \"test/unit/**/*.test.js\"",
+    "test:http": "node --test \"test/http/**/*.test.js\"",
+    "test:integration": "node --env-file-if-exists=.env.test.local --test \"test/integration/**/*.test.js\"",
+    "db:migrate": "node src/database/migrate-cli.js up",
+    "db:migrate:status": "node src/database/migrate-cli.js status",
+    "db:migrate:down": "node src/database/migrate-cli.js down",
+    "auth:bootstrap-admin": "node src/modules/auth/bootstrap-admin-cli.js"
+  },
+  "dependencies": {
+    "@js-temporal/polyfill": "^0.5.1",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.7.0",
+    "mysql2": "^3.24.4",
+    "umzug": "^3.8.3",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "supertest": "^7.3.0"
+  }
+}
