@@ -1,13 +1,14 @@
 import { Temporal } from '@js-temporal/polyfill';
 
 import { ApplicationError } from '../../shared/errors.js';
+import { requireActiveMembership } from '../facility-memberships/authorize.js';
 import { localDayBounds, toInstantString, toMySqlDateTime } from '../../shared/time.js';
 import { bookingError } from './errors.js';
 
 const RECOVERABLE_MYSQL_ERRORS = new Set(['ER_LOCK_DEADLOCK', 'ER_LOCK_WAIT_TIMEOUT']);
 const MAX_TRANSACTION_ATTEMPTS = 3;
 
-export function createMySqlBookingAdapter({ pool }) {
+export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
   if (!pool?.execute || !pool?.getConnection) {
     throw new TypeError('A mysql2 promise pool is required');
   }
@@ -16,6 +17,7 @@ export function createMySqlBookingAdapter({ pool }) {
     readAvailabilityContext,
     confirmBooking,
     listOwnBookings,
+    listOwnerBookings,
     cancelBooking,
     replaceFacilityBookingPolicy,
     deactivateFacility,
@@ -39,7 +41,9 @@ export function createMySqlBookingAdapter({ pool }) {
   async function readAvailabilityContext({ courtId, date }) {
     const connection = await pool.getConnection();
     try {
-      return await loadAvailabilityContext(connection, { courtId, date, lockCourt: false });
+      const snapshot = await loadAvailabilityContext(connection, { courtId, date, lockCourt: false });
+      if (!snapshot) return null;
+      return { ...snapshot, prices: await loadPriceMap(connection, courtId) };
     } finally {
       connection.release();
     }
@@ -64,7 +68,9 @@ export function createMySqlBookingAdapter({ pool }) {
           throw bookingError('invalid_idempotency_key_reuse');
         }
         if (idempotency.row.outcome === 'REJECTED') {
-          return { kind: 'rejected', code: idempotency.row.result_code };
+          return { kind: 'rejected', code: idempotency.row.result_code,
+            currentPriceMinor: idempotency.row.result_price_amount_minor == null
+              ? null : Number(idempotency.row.result_price_amount_minor) };
         }
         if (idempotency.row.outcome === 'SUCCEEDED') {
           const now = await readDatabaseNow(connection);
@@ -91,6 +97,12 @@ export function createMySqlBookingAdapter({ pool }) {
         return { kind: 'rejected', code: 'resource_not_found' };
       }
 
+      if (isPublicCourt && !await isPublicCourt(connection, request.courtId, { requirePrice: false })) {
+        const now = await readDatabaseNow(connection);
+        await completeRejectedIdempotency(connection, idempotency.id, 'resource_not_found', now);
+        return { kind: 'rejected', code: 'resource_not_found' };
+      }
+
       const now = await readDatabaseNow(connection);
       const decision = evaluate({ context: snapshot.context, now });
       if (!decision.accepted) {
@@ -104,10 +116,23 @@ export function createMySqlBookingAdapter({ pool }) {
         return { kind: 'rejected', code: decision.code };
       }
 
+      const [priceRows] = await connection.execute(
+        'SELECT price_amount_minor, currency FROM court_prices WHERE court_id = ? AND duration_minutes = ?',
+        [request.courtId, request.durationMinutes],
+      );
+      const currentPriceMinor = priceRows.length ? Number(priceRows[0].price_amount_minor) : null;
+      if (currentPriceMinor !== request.expectedPriceMinor || priceRows[0]?.currency !== 'COP'
+        || request.currency !== 'COP') {
+        await completeRejectedIdempotency(connection, idempotency.id, 'booking_price_changed', now,
+          currentPriceMinor);
+        return { kind: 'rejected', code: 'booking_price_changed', currentPriceMinor };
+      }
+
       const [insert] = await connection.execute(
         `INSERT INTO bookings
-           (user_id, court_id, start_at, end_at, booking_timezone, status, created_at)
-         VALUES (?, ?, ?, ?, ?, 'CONFIRMADA', ?)`,
+           (user_id, court_id, start_at, end_at, booking_timezone, status, created_at,
+            price_amount_minor, price_currency)
+          VALUES (?, ?, ?, ?, ?, 'CONFIRMADA', ?, ?, 'COP')`,
         [
           userId,
           request.courtId,
@@ -115,6 +140,7 @@ export function createMySqlBookingAdapter({ pool }) {
           toMySqlDateTime(decision.option.endAt),
           snapshot.context.timeZone,
           toMySqlDateTime(now),
+          currentPriceMinor,
         ],
       );
       const bookingId = String(insert.insertId);
@@ -151,6 +177,59 @@ export function createMySqlBookingAdapter({ pool }) {
       values,
     );
     return rows.map(mapBooking);
+  }
+
+  async function listOwnerBookings({ userId, facilityId, courtId, status,
+    startFrom, startBefore, now, limit, cursor }) {
+    const clauses = [
+      'm.user_id = ?', 'm.active = 1', "m.membership_type = 'PROPIETARIO'",
+      'owner.deactivated_at IS NULL', "owner_role.role_code = 'PROPIETARIO'",
+    ];
+    const values = [userId];
+    if (facilityId) { clauses.push('f.id = ?'); values.push(facilityId); }
+    if (courtId) { clauses.push('c.id = ?'); values.push(courtId); }
+    if (startFrom) { clauses.push('b.start_at >= ?'); values.push(toMySqlDateTime(startFrom)); }
+    if (startBefore) { clauses.push('b.start_at < ?'); values.push(toMySqlDateTime(startBefore)); }
+    if (status === 'CANCELADA') clauses.push("b.status = 'CANCELADA'");
+    if (status === 'COMPLETADA') {
+      clauses.push("b.status = 'CONFIRMADA' AND b.end_at <= ?");
+      values.push(toMySqlDateTime(now));
+    }
+    if (status === 'CONFIRMADA') {
+      clauses.push("b.status = 'CONFIRMADA' AND b.end_at > ?");
+      values.push(toMySqlDateTime(now));
+    }
+    if (cursor) {
+      clauses.push('(b.start_at < ? OR (b.start_at = ? AND b.id < ?))');
+      values.push(toMySqlDateTime(cursor.startAt), toMySqlDateTime(cursor.startAt), cursor.id);
+    }
+    values.push(limit);
+    const [rows] = await pool.execute(
+      `SELECT b.id, b.user_id, b.start_at, b.end_at, b.booking_timezone, b.status,
+              b.price_amount_minor, b.price_currency,
+              c.id AS court_id, c.name AS court_name,
+              f.id AS facility_id, f.name AS facility_name,
+              customer.name AS customer_name
+       FROM facility_memberships AS m
+       JOIN users AS owner ON owner.id = m.user_id
+       JOIN user_roles AS owner_role ON owner_role.user_id = owner.id
+       JOIN facilities AS f ON f.id = m.facility_id
+       JOIN courts AS c ON c.facility_id = f.id
+       JOIN bookings AS b ON b.court_id = c.id
+       JOIN users AS customer ON customer.id = b.user_id
+       WHERE ${clauses.join(' AND ')}
+       ORDER BY b.start_at DESC, b.id DESC LIMIT ?`, values,
+    );
+    return rows.map((row) => ({
+      id: String(row.id), status: row.status,
+      startAt: toInstantString(row.start_at), endAt: toInstantString(row.end_at),
+      timeZone: row.booking_timezone,
+      court: { id: String(row.court_id), name: row.court_name },
+      facility: { id: String(row.facility_id), name: row.facility_name },
+      user: { id: String(row.user_id), name: row.customer_name },
+      priceMinor: row.price_amount_minor == null ? null : Number(row.price_amount_minor),
+      currency: row.price_currency,
+    }));
   }
 
   async function cancelBooking({ userId, bookingId, decide }) {
@@ -199,11 +278,13 @@ export function createMySqlBookingAdapter({ pool }) {
     facilityId,
     policy,
     actorUserId,
+    ownerUserId,
     now,
   }) {
     return runTransactionWithRetry(pool, async (connection) => {
       const facility = await lockFacility(connection, facilityId);
       if (!facility) return null;
+      if (ownerUserId) await requireActiveMembership(connection, { facilityId, userId: ownerUserId, lock: true });
       if (facility.deactivated_at != null) throw bookingError('resource_inactive');
       const courts = await lockFacilityCourts(connection, facilityId);
       const next = {
@@ -253,10 +334,11 @@ export function createMySqlBookingAdapter({ pool }) {
     });
   }
 
-  async function deactivateFacility({ facilityId, actorUserId, now }) {
+  async function deactivateFacility({ facilityId, actorUserId, ownerUserId, now }) {
     return runTransactionWithRetry(pool, async (connection) => {
       const facility = await lockFacility(connection, facilityId);
       if (!facility) return null;
+      if (ownerUserId) await requireActiveMembership(connection, { facilityId, userId: ownerUserId, lock: true });
       if (facility.deactivated_at != null) {
         return { facility: mapAdminFacility(facility), operation: unchangedOperation() };
       }
@@ -284,18 +366,19 @@ export function createMySqlBookingAdapter({ pool }) {
     });
   }
 
-  async function createCourt({ facilityId, court, actorUserId, now }) {
+  async function createCourt({ facilityId, court, actorUserId, ownerUserId, now }) {
     return runTransactionWithRetry(pool, async (connection) => {
       const facility = await lockFacility(connection, facilityId);
       if (!facility) return null;
+      if (ownerUserId) await requireActiveMembership(connection, { facilityId, userId: ownerUserId, lock: true });
       if (facility.deactivated_at != null) throw bookingError('resource_inactive');
       const durations = normalizedDurations(court.allowedDurationsMinutes);
       assertCourtConfiguration(court);
       const [insert] = await connection.execute(
         `INSERT INTO courts
            (facility_id, name, description, minimum_separation_minutes,
-            start_interval_minutes, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+           start_interval_minutes, created_at, sport_code)
+          VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [
           facilityId,
           court.name,
@@ -303,6 +386,7 @@ export function createMySqlBookingAdapter({ pool }) {
           court.minimumSeparationMinutes,
           court.startIntervalMinutes,
           toMySqlDateTime(now),
+          court.sportCode ?? null,
         ],
       );
       const courtId = String(insert.insertId);
@@ -325,6 +409,7 @@ export function createMySqlBookingAdapter({ pool }) {
           facility_name: facility.name,
           name: court.name,
           description: court.description ?? null,
+          sport_code: court.sportCode ?? null,
           minimum_separation_minutes: court.minimumSeparationMinutes,
           start_interval_minutes: court.startIntervalMinutes,
           created_at: now,
@@ -345,6 +430,7 @@ export function createMySqlBookingAdapter({ pool }) {
     courtId,
     bookingConfiguration,
     actorUserId,
+    ownerUserId,
     now,
     assessExistingBooking,
   }) {
@@ -352,6 +438,7 @@ export function createMySqlBookingAdapter({ pool }) {
       pool,
       courtId,
       actorUserId,
+      ownerUserId,
       now,
       assessExistingBooking,
       changeType: 'COURT_BOOKING_CONFIGURATION_REPLACED',
@@ -375,8 +462,13 @@ export function createMySqlBookingAdapter({ pool }) {
                WHERE id = ?`,
               [next.minimumSeparationMinutes, next.startIntervalMinutes, courtId],
             );
-            await connection.execute('DELETE FROM court_allowed_durations WHERE court_id = ?', [courtId]);
-            for (const duration of durations) {
+            for (const duration of currentDurations.filter((value) => !durations.includes(value))) {
+              await connection.execute('DELETE FROM court_prices WHERE court_id = ? AND duration_minutes = ?',
+                [courtId, duration]);
+              await connection.execute('DELETE FROM court_allowed_durations WHERE court_id = ? AND duration_minutes = ?',
+                [courtId, duration]);
+            }
+            for (const duration of durations.filter((value) => !currentDurations.includes(value))) {
               await connection.execute(
                 'INSERT INTO court_allowed_durations (court_id, duration_minutes) VALUES (?, ?)',
                 [courtId, duration],
@@ -401,6 +493,7 @@ export function createMySqlBookingAdapter({ pool }) {
     courtId,
     weeklySchedule,
     actorUserId,
+    ownerUserId,
     now,
     assessExistingBooking,
   }) {
@@ -408,6 +501,7 @@ export function createMySqlBookingAdapter({ pool }) {
       pool,
       courtId,
       actorUserId,
+      ownerUserId,
       now,
       assessExistingBooking,
       changeType: 'WEEKLY_SCHEDULE_REPLACED',
@@ -465,6 +559,7 @@ export function createMySqlBookingAdapter({ pool }) {
     localDate,
     dateException,
     actorUserId,
+    ownerUserId,
     now,
     assessExistingBooking,
   }) {
@@ -472,6 +567,7 @@ export function createMySqlBookingAdapter({ pool }) {
       pool,
       courtId,
       actorUserId,
+      ownerUserId,
       now,
       assessExistingBooking,
       changeType: 'DATE_EXCEPTION_PUT',
@@ -520,6 +616,7 @@ export function createMySqlBookingAdapter({ pool }) {
     courtId,
     localDate,
     actorUserId,
+    ownerUserId,
     now,
     assessExistingBooking,
   }) {
@@ -527,6 +624,7 @@ export function createMySqlBookingAdapter({ pool }) {
       pool,
       courtId,
       actorUserId,
+      ownerUserId,
       now,
       assessExistingBooking,
       changeType: 'DATE_EXCEPTION_DELETED',
@@ -574,6 +672,7 @@ export function createMySqlBookingAdapter({ pool }) {
     courtId,
     unavailability,
     actorUserId,
+    ownerUserId,
     now,
     assessExistingBooking,
   }) {
@@ -582,6 +681,7 @@ export function createMySqlBookingAdapter({ pool }) {
       pool,
       courtId,
       actorUserId,
+      ownerUserId,
       now,
       assessExistingBooking,
       changeType: 'UNAVAILABILITY_CREATED',
@@ -634,10 +734,13 @@ export function createMySqlBookingAdapter({ pool }) {
     return rows.length === 0 ? null : mapUnavailability(rows[0]);
   }
 
-  async function deactivateCourt({ courtId, actorUserId, now }) {
+  async function deactivateCourt({ courtId, actorUserId, ownerUserId, now }) {
     return runTransactionWithRetry(pool, async (connection) => {
       const court = await lockAdminCourt(connection, courtId);
       if (!court) return null;
+      if (ownerUserId) await requireActiveMembership(connection, {
+        facilityId: court.facility_id, userId: ownerUserId, lock: true,
+      });
       if (court.deactivated_at != null) {
         return { court: mapAdminCourt(court), operation: unchangedOperation() };
       }
@@ -706,6 +809,7 @@ async function mutateCourtAvailability({
   pool,
   courtId,
   actorUserId,
+  ownerUserId,
   now,
   assessExistingBooking,
   changeType,
@@ -716,6 +820,9 @@ async function mutateCourtAvailability({
   return runTransactionWithRetry(pool, async (connection) => {
     const court = await lockAdminCourt(connection, courtId);
     if (!court) return null;
+    if (ownerUserId) await requireActiveMembership(connection, {
+      facilityId: court.facility_id, userId: ownerUserId, lock: true,
+    });
     if (court.deactivated_at != null || court.facility_deactivated_at != null) {
       throw bookingError('resource_inactive');
     }
@@ -798,7 +905,7 @@ async function lockAdminCourt(connection, courtId) {
 
 async function loadAdminCourt(executor, courtId) {
   const [rows] = await executor.execute(
-    `SELECT c.id, c.facility_id, c.name, c.description,
+    `SELECT c.id, c.facility_id, c.name, c.description, c.sport_code,
             c.minimum_separation_minutes, c.start_interval_minutes,
             c.created_at, c.deactivated_at, f.name AS facility_name,
             f.timezone, f.minimum_advance_minutes, f.maximum_advance_minutes,
@@ -959,6 +1066,7 @@ function mapAdminCourt(row) {
     facility: { id: String(row.facility_id), name: row.facility_name },
     name: row.name,
     description: row.description,
+    ...(Object.hasOwn(row, 'sport_code') ? { sportCode: row.sport_code } : {}),
     minimumSeparationMinutes: Number(row.minimum_separation_minutes),
     startIntervalMinutes: Number(row.start_interval_minutes),
     allowedDurationsMinutes: row.durations ?? [],
@@ -1398,7 +1506,8 @@ async function claimIdempotency(connection, { userId, idempotencyKey, requestHas
   } catch (error) {
     if (error?.code !== 'ER_DUP_ENTRY') throw error;
     const [rows] = await connection.execute(
-      `SELECT id, request_hash, outcome, booking_id, result_code, completed_at
+      `SELECT id, request_hash, outcome, booking_id, result_code, completed_at,
+              result_price_amount_minor, result_price_currency
        FROM idempotency_records
        WHERE user_id = ?
          AND operation = 'CONFIRM_BOOKING'
@@ -1411,12 +1520,14 @@ async function claimIdempotency(connection, { userId, idempotencyKey, requestHas
   }
 }
 
-async function completeRejectedIdempotency(connection, id, code, now) {
+async function completeRejectedIdempotency(connection, id, code, now, currentPriceMinor = null) {
   const [result] = await connection.execute(
     `UPDATE idempotency_records
-     SET outcome = 'REJECTED', booking_id = NULL, result_code = ?, completed_at = ?
+     SET outcome = 'REJECTED', booking_id = NULL, result_code = ?, completed_at = ?,
+         result_price_amount_minor = ?, result_price_currency = ?
      WHERE id = ? AND outcome IS NULL`,
-    [code, toMySqlDateTime(now), id],
+    [code, toMySqlDateTime(now), currentPriceMinor,
+      currentPriceMinor == null ? null : 'COP', id],
   );
   if (result.affectedRows !== 1) throw bookingError('internal_error');
 }
@@ -1426,6 +1537,14 @@ async function readDatabaseNow(connection) {
     "SELECT DATE_FORMAT(UTC_TIMESTAMP(6), '%Y-%m-%d %H:%i:%s.%f') AS now_utc",
   );
   return toInstantString(rows[0].now_utc);
+}
+
+async function loadPriceMap(connection, courtId) {
+  const [rows] = await connection.execute(
+    "SELECT duration_minutes, price_amount_minor FROM court_prices WHERE court_id = ? AND currency = 'COP'",
+    [courtId],
+  );
+  return new Map(rows.map((row) => [Number(row.duration_minutes), Number(row.price_amount_minor)]));
 }
 
 async function loadBooking(connection, bookingId) {
@@ -1439,7 +1558,7 @@ async function loadBooking(connection, bookingId) {
 
 function bookingSelect() {
   return `SELECT b.id, b.user_id, b.start_at, b.end_at, b.booking_timezone,
-                 b.status, b.created_at, b.cancelled_at,
+                 b.status, b.created_at, b.cancelled_at, b.price_amount_minor, b.price_currency,
                  c.id AS court_id, c.name AS court_name,
                  f.id AS facility_id, f.name AS facility_name
           FROM bookings AS b
@@ -1456,6 +1575,8 @@ function mapBooking(row) {
     startAt: toInstantString(row.start_at),
     endAt: toInstantString(row.end_at),
     timeZone: row.booking_timezone,
+    priceMinor: row.price_amount_minor == null ? null : Number(row.price_amount_minor),
+    currency: row.price_currency,
     status: row.status,
     createdAt: toInstantString(row.created_at),
     cancelledAt: row.cancelled_at == null ? null : toInstantString(row.cancelled_at),

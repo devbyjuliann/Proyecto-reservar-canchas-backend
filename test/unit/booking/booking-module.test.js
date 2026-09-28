@@ -134,7 +134,7 @@ describe('booking module orchestration', () => {
     let confirmationDecision;
     const adapter = {
       async readAvailabilityContext() {
-        return { court: { id: '12' }, context };
+        return { court: { id: '12' }, context, prices: new Map([[60, 9000000]]) };
       },
       async confirmBooking({ evaluate }) {
         confirmationDecision = evaluate({ context, now: NOW });
@@ -158,11 +158,14 @@ describe('booking module orchestration', () => {
         localDate: '2026-09-28',
         startTime: '16:00:00',
         durationMinutes: 60,
+        expectedPriceMinor: 9000000,
+        currency: 'COP',
       },
       idempotencyKey: 'attempt-1',
     });
 
     assert.equal(availability.options.length, 1);
+    assert.equal(availability.options[0].priceMinor, 9000000);
     assert.equal(confirmationDecision.accepted, true);
     assert.equal(
       toInstantString(confirmationDecision.option.startAt),

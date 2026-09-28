@@ -13,6 +13,8 @@ const BOOKING = {
   startAt: '2026-09-28T21:00:00.000000Z',
   endAt: '2026-09-28T22:00:00.000000Z',
   timeZone: 'America/Bogota',
+  priceMinor: 9000000,
+  currency: 'COP',
   status: 'CONFIRMADA',
   createdAt: '2026-09-24T14:31:00.000000Z',
   cancelledAt: null,
@@ -29,6 +31,8 @@ function createFixture({ environment = 'test', bookingOverrides = {} } = {}) {
         options: [{
           startTime: '16:00:00',
           durationMinutes: 60,
+          priceMinor: 9000000,
+          currency: 'COP',
           startAt: BOOKING.startAt,
           endAt: BOOKING.endAt,
         }],
@@ -78,6 +82,7 @@ describe('booking HTTP contract', () => {
       .expect(200);
     assert.equal(response.body.court.id, '12');
     assert.equal(response.body.options[0].durationMinutes, 60);
+    assert.equal(response.body.options[0].priceMinor, 9000000);
 
     await request(app)
       .get('/api/v1/courts/12/availability?date=2026-09-28&courtId=13')
@@ -100,6 +105,8 @@ describe('booking HTTP contract', () => {
         localDate: '2026-09-28',
         startTime: '16:00:00',
         durationMinutes: 60,
+        expectedPriceMinor: 9000000,
+        currency: 'COP',
       })
       .expect(400)
       .expect(({ body }) => assert.equal(body.error.code, 'invalid_request'));
@@ -156,6 +163,8 @@ describe('booking HTTP contract', () => {
       localDate: '2026-09-28',
       startTime: '16:00:00',
       durationMinutes: 60,
+      expectedPriceMinor: 9000000,
+      currency: 'COP',
     };
     await request(app)
       .post('/api/v1/bookings')
@@ -179,6 +188,8 @@ describe('booking HTTP contract', () => {
       localDate: '2026-09-28',
       startTime: '16:00:00',
       durationMinutes: 60,
+      expectedPriceMinor: 9000000,
+      currency: 'COP',
     };
     await request(app).post('/api/v1/bookings')
       .set('X-User-Id', '7').set('Idempotency-Key', 'attempt-2')
@@ -221,6 +232,8 @@ describe('booking HTTP contract', () => {
         localDate: '2026-09-28',
         startTime: '16:00:00',
         durationMinutes: 60,
+        expectedPriceMinor: 9000000,
+        currency: 'COP',
         userId: '7',
       })
       .expect(400)
@@ -326,6 +339,8 @@ describe('booking HTTP contract', () => {
           localDate: '2026-09-28',
           startTime: '16:00:00',
           durationMinutes: 60,
+          expectedPriceMinor: 9000000,
+          currency: 'COP',
         })
         .expect(status)
         .expect(({ body }) => assert.equal(body.error.code, code));

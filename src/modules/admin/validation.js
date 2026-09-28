@@ -40,6 +40,7 @@ const instantSchema = z.string()
   }, 'Must be a valid RFC 3339 UTC instant');
 const requiredText = (maximum) => z.string().trim().min(1).max(maximum);
 const nullableText = (maximum) => z.string().max(maximum).nullable();
+const sportCodeSchema = z.string().regex(/^[A-Z0-9_]{2,32}$/);
 const unsignedIntSchema = z.number().int().min(0).max(MAX_UNSIGNED_INT);
 const unsignedSmallintSchema = z.number().int().min(0).max(MAX_UNSIGNED_SMALLINT);
 const positiveSmallintSchema = z.number().int().min(1).max(MAX_UNSIGNED_SMALLINT);
@@ -66,6 +67,9 @@ const statePageQuerySchema = pageQuerySchema.extend({
 const createFacilitySchema = z.object({
   name: requiredText(150),
   timeZone: timeZoneSchema,
+  city: requiredText(120).optional(),
+  address: requiredText(250).optional(),
+  description: requiredText(1000).optional(),
   minimumAdvanceMinutes: unsignedIntSchema.optional(),
   maximumAdvanceMinutes: unsignedIntSchema.optional(),
 }).strict().superRefine((value, context) => {
@@ -78,7 +82,12 @@ const createFacilitySchema = z.object({
     context.addIssue({ code: 'custom', path: ['minimumAdvanceMinutes'], message: 'Must not exceed maximumAdvanceMinutes' });
   }
 });
-const facilityPatchSchema = z.object({ name: requiredText(150).optional() }).strict()
+const facilityPatchSchema = z.object({
+  name: requiredText(150).optional(),
+  city: requiredText(120).optional(),
+  address: requiredText(250).optional(),
+  description: requiredText(1000).optional(),
+}).strict()
   .refine((value) => Object.keys(value).length > 0, 'At least one supported field is required');
 const facilityBookingPolicySchema = z.object({
   timeZone: timeZoneSchema,
@@ -92,6 +101,7 @@ const facilityBookingPolicySchema = z.object({
 const createCourtSchema = z.object({
   name: requiredText(150),
   description: nullableText(500).optional(),
+  sportCode: sportCodeSchema.nullable().optional(),
   minimumSeparationMinutes: unsignedSmallintSchema,
   startIntervalMinutes: positiveSmallintSchema,
   allowedDurationsMinutes: durationsSchema,
@@ -99,6 +109,7 @@ const createCourtSchema = z.object({
 const courtPatchSchema = z.object({
   name: requiredText(150).optional(),
   description: nullableText(500).optional(),
+  sportCode: sportCodeSchema.nullable().optional(),
 }).strict().refine(
   (value) => Object.keys(value).length > 0,
   'At least one supported field is required',

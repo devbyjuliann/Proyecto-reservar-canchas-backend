@@ -32,8 +32,9 @@ test('create user validation rejects malformed email', () => {
   );
 });
 
-test('only the two persisted roles are accepted', () => {
+test('only the three persisted roles are accepted', () => {
   assert.equal(validateRole('USUARIO'), 'USUARIO');
+  assert.equal(validateRole('PROPIETARIO'), 'PROPIETARIO');
   assert.equal(validateRole('ADMINISTRADOR'), 'ADMINISTRADOR');
   assert.throws(() => validateRole('SUPERADMIN'), {
     code: 'USERS_VALIDATION_ERROR',

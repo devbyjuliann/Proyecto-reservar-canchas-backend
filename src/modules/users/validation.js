@@ -1,6 +1,6 @@
 import { UsersValidationError } from './errors.js';
 
-export const USER_ROLES = Object.freeze(['USUARIO', 'ADMINISTRADOR']);
+export const USER_ROLES = Object.freeze(['USUARIO', 'PROPIETARIO', 'ADMINISTRADOR']);
 
 export function normalizeEmail(email) {
   if (typeof email !== 'string') {
@@ -31,7 +31,7 @@ export function validateCreateUserInput({ name, email } = {}) {
 
 export function validateRole(role) {
   if (!USER_ROLES.includes(role)) {
-    throw new UsersValidationError('Role must be USUARIO or ADMINISTRADOR');
+    throw new UsersValidationError('Role must be USUARIO, PROPIETARIO or ADMINISTRADOR');
   }
 
   return role;

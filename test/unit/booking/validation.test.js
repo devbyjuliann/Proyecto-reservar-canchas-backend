@@ -14,6 +14,8 @@ const CONFIRMATION = {
   localDate: '2026-09-28',
   startTime: '16:00:00',
   durationMinutes: 60,
+  expectedPriceMinor: 9000000,
+  currency: 'COP',
 };
 
 test('confirmation accepts only the documented exact payload', () => {
@@ -27,6 +29,12 @@ test('confirmation accepts only the documented exact payload', () => {
     () => validateConfirmationRequest({ ...input, startTime: '16:00' }),
     { code: 'invalid_request' },
   );
+  for (const price of [0, -1, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => validateConfirmationRequest({ ...input, expectedPriceMinor: price }),
+      { code: 'invalid_request' });
+  }
+  assert.throws(() => validateConfirmationRequest({ ...input, currency: 'USD' }),
+    { code: 'invalid_request' });
 });
 
 test('public ids accept only canonical positive BIGINT UNSIGNED strings', () => {

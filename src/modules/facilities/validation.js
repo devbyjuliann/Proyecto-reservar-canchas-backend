@@ -21,6 +21,9 @@ export function validateCreateFacilityInput(input = {}) {
   rejectUnknown(input, [
     'name',
     'timeZone',
+    'city',
+    'address',
+    'description',
     'minimumAdvanceMinutes',
     'maximumAdvanceMinutes',
   ]);
@@ -44,14 +47,18 @@ export function validateCreateFacilityInput(input = {}) {
   if (minimumAdvanceMinutes > maximumAdvanceMinutes) {
     invalid('minimumAdvanceMinutes cannot exceed maximumAdvanceMinutes');
   }
-  return { name, timeZone, minimumAdvanceMinutes, maximumAdvanceMinutes };
+  return {
+    name, timeZone, minimumAdvanceMinutes, maximumAdvanceMinutes,
+    ...catalogFields(input),
+  };
 }
 
 export function validateUpdateFacilityInput(input = {}) {
   assertPlainObject(input, 'input');
-  rejectUnknown(input, ['name']);
+  rejectUnknown(input, ['name', 'city', 'address', 'description']);
   const changes = {};
   if (Object.hasOwn(input, 'name')) changes.name = requiredText(input.name, 'name', 150);
+  Object.assign(changes, catalogFields(input));
   requireChanges(changes);
   return changes;
 }
@@ -94,12 +101,19 @@ export function validateCreateCourtInput(input = {}) {
 
 export function validateUpdateCourtInput(input = {}) {
   assertPlainObject(input, 'input');
-  rejectUnknown(input, ['name', 'description']);
+  rejectUnknown(input, ['name', 'description', 'sportCode']);
   const changes = {};
   if (Object.hasOwn(input, 'name')) changes.name = requiredText(input.name, 'name', 150);
   if (Object.hasOwn(input, 'description')) {
     if (input.description === undefined) invalid('description must be a string or null', 'description');
     changes.description = optionalText(input.description, 'description', 500);
+  }
+  if (Object.hasOwn(input, 'sportCode')) {
+    if (input.sportCode !== null
+      && (typeof input.sportCode !== 'string' || !/^[A-Z0-9_]{2,32}$/.test(input.sportCode))) {
+      invalid('sportCode must be an uppercase sport code or null', 'sportCode');
+    }
+    changes.sportCode = input.sportCode;
   }
   requireChanges(changes);
   return changes;
@@ -157,6 +171,14 @@ export function validateNow(now) {
       cause,
     });
   }
+}
+
+function catalogFields(input) {
+  const fields = {};
+  for (const [field, maximum] of [['city', 120], ['address', 250], ['description', 1000]]) {
+    if (Object.hasOwn(input, field)) fields[field] = requiredText(input[field], field, maximum);
+  }
+  return fields;
 }
 
 function validateTimezone(timeZone) {

@@ -27,6 +27,7 @@ export function createBookingModule({ adapter, clock }) {
     getAvailability,
     confirmBooking,
     listOwnBookings,
+    listOwnerBookings,
     cancelBooking,
     replaceFacilityBookingPolicy,
     deactivateFacility,
@@ -54,6 +55,7 @@ export function createBookingModule({ adapter, clock }) {
 
     const options = runDomain(now, (domain) =>
       domain.generateAvailability(snapshot.context));
+    const pricedOptions = options.filter((option) => snapshot.prices?.has(option.durationMinutes));
     return {
       court: {
         id: String(snapshot.court.id),
@@ -61,9 +63,11 @@ export function createBookingModule({ adapter, clock }) {
       },
       date,
       generatedAt: now,
-      options: options.map(({ startTime, durationMinutes, startAt, endAt }) => ({
+      options: pricedOptions.map(({ startTime, durationMinutes, startAt, endAt }) => ({
         startTime,
         durationMinutes,
+        priceMinor: snapshot.prices.get(durationMinutes),
+        currency: 'COP',
         startAt: toInstantString(startAt),
         endAt: toInstantString(endAt),
       })),
@@ -77,6 +81,8 @@ export function createBookingModule({ adapter, clock }) {
         localDate: request.localDate,
         startTime: request.startTime,
         durationMinutes: request.durationMinutes,
+        expectedPriceMinor: request.expectedPriceMinor,
+        currency: request.currency,
       }))
       .digest();
 
@@ -114,7 +120,9 @@ export function createBookingModule({ adapter, clock }) {
       },
     });
 
-    if (result.kind === 'rejected') throw bookingError(result.code);
+    if (result.kind === 'rejected') throw bookingError(result.code, result.code === 'booking_price_changed'
+      ? { details: { currentPriceMinor: result.currentPriceMinor ?? null, currency: 'COP' } }
+      : undefined);
     return { booking: presentBooking(result.booking, result.now), replayed: result.replayed };
   }
 
@@ -138,6 +146,38 @@ export function createBookingModule({ adapter, clock }) {
           : null,
       },
     };
+  }
+
+  async function listOwnerBookings({ actor, limit, cursor, ...input }) {
+    assertOperationalActor(actor);
+    if (!actor.ownerScope) throw bookingError('forbidden');
+    const filters = { userId: String(actor.id) };
+    for (const name of ['facilityId', 'courtId', 'status', 'startFrom', 'startBefore']) {
+      if (input[name] !== undefined) filters[name] = input[name];
+    }
+    const position = cursor === undefined ? undefined
+      : decodeAdminCursor(cursor, 'owner-bookings', filters);
+    const now = toInstantString(clock.now());
+    const rows = await adapter.listOwnerBookings({ ...input, userId: String(actor.id),
+      now, limit: limit + 1, cursor: position });
+    const items = rows.slice(0, limit).map((row) => ({
+      id: row.id,
+      persistedStatus: row.status,
+      status: effectiveBookingStatus(row, now),
+      startAt: row.startAt,
+      endAt: row.endAt,
+      timeZone: row.timeZone,
+      durationMinutes: Temporal.Instant.from(row.startAt).until(row.endAt).total('minutes'),
+      court: row.court,
+      facility: row.facility,
+      user: row.user,
+      priceMinor: row.priceMinor,
+      currency: row.currency,
+    }));
+    const last = rows[limit - 1];
+    return { items, page: { nextCursor: rows.length > limit
+      ? encodeAdminCursor('owner-bookings', filters, { startAt: last.startAt, id: last.id })
+      : null } };
   }
 
   async function cancelBooking({ actor, bookingId }) {
@@ -290,7 +330,7 @@ export function createBookingModule({ adapter, clock }) {
   }
 
   async function adminRead(actor, adapterMethod, input) {
-    assertAdministrator(actor);
+    assertOperationalActor(actor);
     const now = toInstantString(clock.now());
     const result = await adapter[adapterMethod]({
       ...input,
@@ -302,7 +342,7 @@ export function createBookingModule({ adapter, clock }) {
   }
 
   async function adminMutation(actor, adapterMethod, input) {
-    assertAdministrator(actor);
+    assertOperationalActor(actor);
     const now = toInstantString(clock.now());
     const operationInput = input.assessExistingBooking
       ? {
@@ -315,6 +355,7 @@ export function createBookingModule({ adapter, clock }) {
     const result = await adapter[adapterMethod]({
       ...operationInput,
       actorUserId: String(actor.id),
+      ...(actor.ownerScope ? { ownerUserId: String(actor.id) } : {}),
       now,
     });
     if (result == null) throw bookingError('resource_not_found');
@@ -329,7 +370,7 @@ export function createBookingModule({ adapter, clock }) {
     limit,
     ...input
   }) {
-    assertAdministrator(actor);
+    assertOperationalActor(actor);
     const now = toInstantString(clock.now());
     const decodedCursor = cursor === undefined
       ? undefined
@@ -369,6 +410,14 @@ function assertAdministrator(actor) {
   if (!actor || !Array.isArray(actor.roles) || !actor.roles.includes('ADMINISTRADOR') || actor.id == null) {
     throw bookingError('forbidden');
   }
+}
+
+function assertOperationalActor(actor) {
+  if (actor?.ownerScope === true) {
+    if (actor.id == null || !actor.roles?.includes('PROPIETARIO')) throw bookingError('forbidden');
+    return;
+  }
+  assertAdministrator(actor);
 }
 
 function encodeAdminCursor(kind, filters, position) {
@@ -425,9 +474,11 @@ function validateAdminCursorPosition(kind, position) {
     ? 'startAt'
     : kind === 'operational-conflicts'
       ? 'detectedAt'
+      : kind === 'owner-bookings'
+        ? 'startAt'
       : null;
   if (instantField === null) throw new Error('Invalid cursor kind');
-  if (Object.keys(position).sort().join(',') !== `${instantField},id`) {
+  if (Object.keys(position).sort().join(',') !== ['id', instantField].sort().join(',')) {
     throw new Error('Invalid cursor position');
   }
   if (!isCanonicalId(position.id)) throw new Error('Invalid cursor position');
@@ -462,6 +513,8 @@ function presentBooking(booking, now) {
     startAt: toInstantString(booking.startAt),
     endAt: toInstantString(booking.endAt),
     timeZone: booking.timeZone,
+    priceMinor: booking.priceMinor ?? null,
+    currency: booking.currency ?? null,
     status: effectiveBookingStatus({
       status: booking.status,
       endAt: booking.endAt,

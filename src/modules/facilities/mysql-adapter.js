@@ -1,4 +1,6 @@
-import { toMySqlDateTime } from '../../shared/time.js';
+import { toInstantString, toMySqlDateTime } from '../../shared/time.js';
+import { requireActiveMembership } from '../facility-memberships/authorize.js';
+import { facilitiesError } from './errors.js';
 
 export function createMySqlFacilitiesAdapter({ pool }) {
   if (!pool?.execute || !pool?.getConnection) {
@@ -25,7 +27,9 @@ export function createMySqlFacilitiesAdapter({ pool }) {
     values.push(limit);
     const [rows] = await pool.execute(
       `SELECT id, name, timezone, minimum_advance_minutes,
-              maximum_advance_minutes, created_at, deactivated_at
+              maximum_advance_minutes, created_at, deactivated_at,
+              city, address, description, publication_status, published_at,
+              published_by_user_id, unpublished_at
        FROM facilities
        WHERE ${conditions.join(' AND ')}
        ORDER BY name ASC, id ASC
@@ -35,26 +39,68 @@ export function createMySqlFacilitiesAdapter({ pool }) {
     return rows.map(mapFacility);
   }
 
-  async function createFacility({ input, now }) {
-    const [result] = await pool.execute(
+  async function createFacility({ input, now, ownerUserId }) {
+    if (ownerUserId) {
+      const connection = await pool.getConnection();
+      try {
+        await connection.beginTransaction();
+        const [owners] = await connection.execute(
+          `SELECT u.id FROM users u JOIN user_roles r ON r.user_id = u.id
+           WHERE u.id = ? AND u.deactivated_at IS NULL AND r.role_code = 'PROPIETARIO'
+           FOR UPDATE`, [ownerUserId],
+        );
+        if (!owners.length) throw facilitiesError('forbidden');
+        const result = await insertFacility(connection, input, now);
+        const [membership] = await connection.execute(
+          `INSERT INTO facility_memberships
+           (facility_id, user_id, membership_type, active, created_at, created_by_user_id)
+           VALUES (?, ?, 'PROPIETARIO', 1, ?, ?)`,
+          [result.insertId, ownerUserId, toMySqlDateTime(now), ownerUserId],
+        );
+        await connection.commit();
+        return { facility: await getFacility(result.insertId), membership: {
+          id: String(membership.insertId), facilityId: String(result.insertId),
+          userId: String(ownerUserId), membershipRole: 'PROPIETARIO', active: true,
+          grantedAt: toInstantString(now), revokedAt: null, createdByUserId: String(ownerUserId),
+        } };
+      } catch (error) {
+        await connection.rollback();
+        throw error;
+      } finally {
+        connection.release();
+      }
+    }
+    const result = await insertFacility(pool, input, now);
+    return { facility: await getFacility(result.insertId) };
+  }
+
+  async function insertFacility(executor, input, now) {
+    const [result] = await executor.execute(
       `INSERT INTO facilities
-         (name, timezone, minimum_advance_minutes, maximum_advance_minutes, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
+          (name, timezone, minimum_advance_minutes, maximum_advance_minutes,
+           created_at, city, city_normalized, address, description)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         input.name,
         input.timeZone,
         input.minimumAdvanceMinutes,
         input.maximumAdvanceMinutes,
         toMySqlDateTime(now),
+        input.city ?? null,
+        input.city?.normalize('NFC').toLowerCase() ?? null,
+        input.address ?? null,
+        input.description ?? null,
       ],
     );
-    return { facility: await getFacility(result.insertId) };
+    return result;
   }
 
   async function getFacility(facilityId) {
     const [rows] = await pool.execute(
       `SELECT id, name, timezone, minimum_advance_minutes,
-              maximum_advance_minutes, created_at, deactivated_at
+              maximum_advance_minutes, created_at, deactivated_at,
+              city, address, description, publication_status, published_at,
+              published_by_user_id, unpublished_at
        FROM facilities
        WHERE id = ?`,
       [facilityId],
@@ -62,28 +108,44 @@ export function createMySqlFacilitiesAdapter({ pool }) {
     return rows.length === 0 ? null : mapFacility(rows[0]);
   }
 
-  async function updateFacility({ facilityId, input }) {
+  async function updateFacility({ facilityId, input, ownerUserId }) {
     const connection = await pool.getConnection();
     try {
       await connection.beginTransaction();
       const [rows] = await connection.execute(
         `SELECT id, name, timezone, minimum_advance_minutes,
-                maximum_advance_minutes, created_at, deactivated_at
+                maximum_advance_minutes, created_at, deactivated_at,
+                city, address, description, publication_status, published_at,
+                published_by_user_id, unpublished_at
          FROM facilities WHERE id = ? FOR UPDATE`,
         [facilityId],
       );
       if (rows.length === 0) return await rollbackResult(connection, 'not_found');
+      if (ownerUserId) await requireActiveMembership(connection, {
+        facilityId, userId: ownerUserId, lock: true,
+      });
       if (rows[0].deactivated_at != null) return await rollbackResult(connection, 'inactive');
 
-      const changed = rows[0].name !== input.name;
+      const next = {
+        name: input.name ?? rows[0].name,
+        city: input.city ?? rows[0].city,
+        address: input.address ?? rows[0].address,
+        description: input.description ?? rows[0].description,
+      };
+      const changed = Object.entries(next).some(([key, value]) => value !== rows[0][key]);
       if (changed) {
-        await connection.execute('UPDATE facilities SET name = ? WHERE id = ?', [input.name, facilityId]);
+        await connection.execute(
+          `UPDATE facilities SET name = ?, city = ?, city_normalized = ?, address = ?, description = ?
+           WHERE id = ?`,
+          [next.name, next.city, next.city?.normalize('NFC').toLowerCase() ?? null,
+            next.address, next.description, facilityId],
+        );
       }
       await connection.commit();
       return {
         status: 'ok',
         changed,
-        facility: mapFacility({ ...rows[0], name: input.name }),
+        facility: mapFacility({ ...rows[0], ...next }),
       };
     } catch (error) {
       await connection.rollback();
@@ -105,7 +167,7 @@ export function createMySqlFacilitiesAdapter({ pool }) {
     }
     values.push(limit);
     const [rows] = await pool.execute(
-      `SELECT c.id, c.name, c.description, c.minimum_separation_minutes,
+      `SELECT c.id, c.name, c.description, c.sport_code, c.minimum_separation_minutes,
               c.start_interval_minutes, c.created_at, c.deactivated_at,
               f.id AS facility_id, f.name AS facility_name
        FROM courts AS c
@@ -121,7 +183,7 @@ export function createMySqlFacilitiesAdapter({ pool }) {
 
   async function getCourt(courtId) {
     const [rows] = await pool.execute(
-      `SELECT c.id, c.name, c.description, c.minimum_separation_minutes,
+      `SELECT c.id, c.name, c.description, c.sport_code, c.minimum_separation_minutes,
               c.start_interval_minutes, c.created_at, c.deactivated_at,
               f.id AS facility_id, f.name AS facility_name
        FROM courts AS c
@@ -134,12 +196,12 @@ export function createMySqlFacilitiesAdapter({ pool }) {
     return mapCourt(rows[0]);
   }
 
-  async function updateCourt({ courtId, input }) {
+  async function updateCourt({ courtId, input, ownerUserId }) {
     const connection = await pool.getConnection();
     try {
       await connection.beginTransaction();
       const [rows] = await connection.execute(
-        `SELECT c.id, c.name, c.description, c.minimum_separation_minutes,
+        `SELECT c.id, c.name, c.description, c.sport_code, c.minimum_separation_minutes,
                 c.start_interval_minutes, c.created_at, c.deactivated_at,
                 f.id AS facility_id, f.name AS facility_name,
                 f.deactivated_at AS facility_deactivated_at
@@ -150,6 +212,9 @@ export function createMySqlFacilitiesAdapter({ pool }) {
       );
       if (rows.length === 0) return await rollbackResult(connection, 'not_found');
       const current = rows[0];
+      if (ownerUserId) await requireActiveMembership(connection, {
+        facilityId: current.facility_id, userId: ownerUserId, lock: true,
+      });
       if (current.deactivated_at != null || current.facility_deactivated_at != null) {
         return await rollbackResult(connection, 'inactive');
       }
@@ -158,11 +223,13 @@ export function createMySqlFacilitiesAdapter({ pool }) {
       const description = Object.hasOwn(input, 'description')
         ? input.description
         : current.description;
-      const changed = name !== current.name || description !== current.description;
+      const sportCode = Object.hasOwn(input, 'sportCode') ? input.sportCode : current.sport_code;
+      const changed = name !== current.name || description !== current.description
+        || sportCode !== current.sport_code;
       if (changed) {
         await connection.execute(
-          'UPDATE courts SET name = ?, description = ? WHERE id = ?',
-          [name, description, courtId],
+          'UPDATE courts SET name = ?, description = ?, sport_code = ? WHERE id = ?',
+          [name, description, sportCode, courtId],
         );
       }
       const [durations] = await connection.execute(
@@ -178,6 +245,7 @@ export function createMySqlFacilitiesAdapter({ pool }) {
           ...current,
           name,
           description,
+          sport_code: sportCode,
           allowedDurationsMinutes: durations.map((row) => row.duration_minutes),
         }),
       };
@@ -228,6 +296,13 @@ function mapFacility(row) {
     maximumAdvanceMinutes: row.maximum_advance_minutes,
     createdAt: row.created_at,
     deactivatedAt: row.deactivated_at,
+    ...(Object.hasOwn(row, 'city') ? {
+      city: row.city, address: row.address, description: row.description,
+      publicationState: row.publication_status,
+      publishedAt: row.published_at,
+      publishedByUserId: row.published_by_user_id == null ? null : String(row.published_by_user_id),
+      unpublishedAt: row.unpublished_at,
+    } : {}),
   };
 }
 
@@ -237,6 +312,7 @@ function mapCourt(row) {
     facility: { id: row.facility_id, name: row.facility_name },
     name: row.name,
     description: row.description,
+    ...(Object.hasOwn(row, 'sport_code') ? { sportCode: row.sport_code } : {}),
     minimumSeparationMinutes: row.minimum_separation_minutes,
     startIntervalMinutes: row.start_interval_minutes,
     allowedDurationsMinutes: row.allowedDurationsMinutes ?? [],

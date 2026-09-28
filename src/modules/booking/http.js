@@ -9,7 +9,7 @@ import {
   validateOwnBookingsRequest,
 } from './validation.js';
 
-export function createBookingRouter({ booking, requireIdentity }) {
+export function createBookingRouter({ booking, requireIdentity, catalog }) {
   if (!booking || typeof requireIdentity !== 'function') {
     throw new TypeError('booking and requireIdentity are required');
   }
@@ -24,6 +24,9 @@ export function createBookingRouter({ booking, requireIdentity }) {
       courtId: request.params.courtId,
       date: request.query.date,
     });
+    if (catalog && !await catalog.isCourtVisible(input.courtId)) {
+      throw bookingError('resource_not_found');
+    }
     response.json(await booking.getAvailability(input));
   });
 

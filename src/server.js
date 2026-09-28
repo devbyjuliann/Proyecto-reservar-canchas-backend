@@ -11,13 +11,18 @@ import {
 import { createAuthModule, createMySqlAuthAdapter } from './modules/auth/index.js';
 import { createMySqlUsersAdapter } from './modules/users/index.js';
 import { createFacilitiesModule, createMySqlFacilitiesAdapter } from './modules/facilities/index.js';
+import { createOwnerApplicationsModule, createMySqlOwnerApplicationsAdapter } from './modules/owner-applications/index.js';
+import { createFacilityMembershipsModule, createMySqlFacilityMembershipsAdapter } from './modules/facility-memberships/index.js';
+import { createPublicCatalogModule, createMySqlPublicCatalogAdapter } from './modules/public-catalog/index.js';
+import { createCourtPricingModule, createMySqlCourtPricingAdapter } from './modules/court-pricing/index.js';
 import { createSystemClock } from './shared/clock.js';
 
 export async function startServer() {
   const config = loadAppConfig();
   const pool = createMySqlPool();
   const usersAdapter = createMySqlUsersAdapter({ pool });
-  const bookingAdapter = createMySqlBookingAdapter({ pool });
+  const catalogAdapter = createMySqlPublicCatalogAdapter({ pool });
+  const bookingAdapter = createMySqlBookingAdapter({ pool, isPublicCourt: catalogAdapter.isPublicCourt });
   const clock = createSystemClock();
   const auth = createAuthModule({ adapter: createMySqlAuthAdapter({ pool }), clock });
   const booking = createBookingModule({
@@ -25,10 +30,26 @@ export async function startServer() {
     clock,
   });
   const facilities = createFacilitiesModule({ adapter: createMySqlFacilitiesAdapter({ pool }), clock });
+  const ownerApplications = createOwnerApplicationsModule({
+    adapter: createMySqlOwnerApplicationsAdapter({ pool }), clock,
+  });
+  const memberships = createFacilityMembershipsModule({
+    adapter: createMySqlFacilityMembershipsAdapter({ pool }), clock,
+  });
+  const catalog = createPublicCatalogModule({
+    adapter: catalogAdapter, clock,
+  });
+  const pricing = createCourtPricingModule({
+    adapter: createMySqlCourtPricingAdapter({ pool }), memberships,
+  });
   const app = createApp({
     booking,
     facilities,
     auth,
+    ownerApplications,
+    memberships,
+    catalog,
+    pricing,
     environment: config.environment,
     frontendOrigin: config.frontendOrigin,
     findActiveUserById: (userId) => usersAdapter.findById(userId),

@@ -7,6 +7,7 @@ const MESSAGES = Object.freeze({
   invalid_booking_option: 'The selected booking option is invalid',
   option_not_available: 'The selected booking option is not available',
   booking_conflict: 'The selected booking option conflicts with another booking',
+  booking_price_changed: 'The price for the selected booking option has changed',
   invalid_idempotency_key_reuse: 'The idempotency key was used for another request',
   booking_already_started: 'The booking has already started',
   invalid_booking_state: 'The booking state does not allow this operation',

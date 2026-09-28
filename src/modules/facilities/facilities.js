@@ -44,13 +44,15 @@ export function createFacilitiesModule({ adapter, clock }) {
   }
 
   async function createFacility({ actor, input, now, ...flatInput } = {}) {
-    assertAdministrator(actor);
+    assertFacilityActor(actor);
     const result = await adapter.createFacility({
       input: validateCreateFacilityInput(input ?? flatInput),
       now: validateNow(now ?? clock?.now?.()),
+      ...(actor.ownerScope ? { ownerUserId: String(actor.id) } : {}),
     });
     return {
       facility: presentFacility(result.facility ?? result),
+      ...(result.membership ? { membership: result.membership } : {}),
       operation: { changed: true, changes: [] },
     };
   }
@@ -64,10 +66,11 @@ export function createFacilitiesModule({ adapter, clock }) {
   }
 
   async function updateFacility({ actor, facilityId, input, ...flatInput } = {}) {
-    assertAdministrator(actor);
+    assertFacilityActor(actor);
     const result = await adapter.updateFacility({
       facilityId: validateId(facilityId, 'facilityId'),
       input: validateUpdateFacilityInput(input ?? flatInput),
+      ...(actor.ownerScope ? { ownerUserId: String(actor.id) } : {}),
     });
     assertMutationResult(result);
     return {
@@ -77,7 +80,7 @@ export function createFacilitiesModule({ adapter, clock }) {
   }
 
   async function listCourts({ actor, facilityId, state, limit, cursor, ...unknown } = {}) {
-    assertAdministrator(actor);
+    assertFacilityActor(actor);
     rejectUnknownArguments(unknown);
     const id = validateId(facilityId, 'facilityId');
     const filter = validateState(state);
@@ -94,7 +97,7 @@ export function createFacilitiesModule({ adapter, clock }) {
   }
 
   async function getCourt({ actor, courtId, ...unknown } = {}) {
-    assertAdministrator(actor);
+    assertFacilityActor(actor);
     rejectUnknownArguments(unknown);
     const court = await adapter.getCourt(validateId(courtId, 'courtId'));
     if (!court) throw facilitiesError('resource_not_found');
@@ -102,10 +105,11 @@ export function createFacilitiesModule({ adapter, clock }) {
   }
 
   async function updateCourt({ actor, courtId, input, ...flatInput } = {}) {
-    assertAdministrator(actor);
+    assertFacilityActor(actor);
     const result = await adapter.updateCourt({
       courtId: validateId(courtId, 'courtId'),
       input: validateUpdateCourtInput(input ?? flatInput),
+      ...(actor.ownerScope ? { ownerUserId: String(actor.id) } : {}),
     });
     assertMutationResult(result);
     return {
@@ -113,6 +117,16 @@ export function createFacilitiesModule({ adapter, clock }) {
       operation: operation(result.changed),
     };
   }
+}
+
+function assertFacilityActor(actor) {
+  if (actor?.ownerScope === true) {
+    if (actor.id == null || !actor.roles?.includes('PROPIETARIO')) {
+      throw facilitiesError('forbidden');
+    }
+    return;
+  }
+  assertAdministrator(actor);
 }
 
 function assertMutationResult(result) {
@@ -159,6 +173,13 @@ function presentFacility(facility) {
       ? null
       : toInstantString(facility.deactivatedAt),
     state: facility.deactivatedAt == null ? 'active' : 'inactive',
+    ...(Object.hasOwn(facility, 'city') ? {
+      city: facility.city, address: facility.address, description: facility.description,
+      publicationState: facility.publicationState,
+      publishedAt: facility.publishedAt == null ? null : toInstantString(facility.publishedAt),
+      publishedByUserId: facility.publishedByUserId,
+      unpublishedAt: facility.unpublishedAt == null ? null : toInstantString(facility.unpublishedAt),
+    } : {}),
   };
 }
 
@@ -168,6 +189,7 @@ function presentCourt(court) {
     facility: { id: String(court.facility.id), name: court.facility.name },
     name: court.name,
     description: court.description,
+    ...(Object.hasOwn(court, 'sportCode') ? { sportCode: court.sportCode } : {}),
     minimumSeparationMinutes: Number(court.minimumSeparationMinutes),
     startIntervalMinutes: Number(court.startIntervalMinutes),
     allowedDurationsMinutes: court.allowedDurationsMinutes.map(Number).sort((a, b) => a - b),

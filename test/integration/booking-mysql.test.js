@@ -354,6 +354,10 @@ async function seedFixture(pool) {
       'INSERT INTO court_allowed_durations (court_id, duration_minutes) VALUES (?, 60)',
       [courtId],
     );
+    await connection.execute(
+      "INSERT INTO court_prices (court_id, duration_minutes, price_amount_minor, currency) VALUES (?, 60, 9000000, 'COP')",
+      [courtId],
+    );
 
     const localDate = Temporal.Now.instant()
       .toZonedDateTimeISO('America/Bogota')
@@ -374,6 +378,8 @@ async function seedFixture(pool) {
         localDate: localDate.toString(),
         startTime: '12:00:00',
         durationMinutes: 60,
+        expectedPriceMinor: 9000000,
+        currency: 'COP',
       },
     };
   } catch (error) {
@@ -398,6 +404,7 @@ async function cleanFixture(pool, fixture) {
       'DELETE FROM court_weekly_periods WHERE court_id = ?',
       [fixture.courtId],
     );
+    await connection.execute('DELETE FROM court_prices WHERE court_id = ?', [fixture.courtId]);
     await connection.execute(
       'DELETE FROM court_allowed_durations WHERE court_id = ?',
       [fixture.courtId],

@@ -34,6 +34,8 @@ const confirmationSchema = z.object({
   localDate: localDateSchema,
   startTime: localTimeSchema,
   durationMinutes: z.number().int().positive().max(65_535),
+  expectedPriceMinor: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+  currency: z.literal('COP'),
 }).strict();
 
 const ownBookingsSchema = z.object({
