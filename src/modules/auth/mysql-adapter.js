@@ -14,6 +14,7 @@ export function createMySqlAuthAdapter({ pool }) {
     findActiveSession,
     revokeSession,
     bootstrapAdministrator,
+    resetAdministratorPassword,
   });
 
   async function register({ name, email, credential, now }) {
@@ -135,6 +136,53 @@ export function createMySqlAuthAdapter({ pool }) {
           // Releasing the connection also releases its advisory lock.
         }
       }
+      connection.release();
+    }
+  }
+
+  async function resetAdministratorPassword({ email, credential, now }) {
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [administrators] = await connection.execute(
+        `SELECT u.id FROM users AS u
+         JOIN user_roles AS ur ON ur.user_id = u.id
+         WHERE u.email = ? AND ur.role_code = 'ADMINISTRADOR'
+         FOR UPDATE`,
+        [email],
+      );
+      if (administrators.length === 0) {
+        await connection.rollback();
+        return false;
+      }
+      const timestamp = toMySqlDateTime(now);
+      const userId = administrators[0].id;
+      await connection.execute(
+        `UPDATE user_credentials
+         SET password_hash = ?, password_salt = ?, algorithm = ?, scrypt_cost = ?,
+             scrypt_block_size = ?, scrypt_parallelization = ?, updated_at = ?
+         WHERE user_id = ?`,
+        [
+          credential.hash,
+          credential.salt,
+          credential.algorithm,
+          credential.parameters.cost,
+          credential.parameters.blockSize,
+          credential.parameters.parallelization,
+          timestamp,
+          userId,
+        ],
+      );
+      await connection.execute(
+        'UPDATE sessions SET revoked_at = COALESCE(revoked_at, ?) WHERE user_id = ?',
+        [timestamp, userId],
+      );
+      await connection.commit();
+      return true;
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
       connection.release();
     }
   }

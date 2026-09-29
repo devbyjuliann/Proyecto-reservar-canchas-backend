@@ -133,6 +133,38 @@ describe('authentication MySQL integration', { skip: !MYSQL_AVAILABLE, timeout: 
     assert.equal(await futureAuth.resolveSession(second.token), null);
   });
 
+  it('resets only an administrator credential with scrypt and revokes every active session', async () => {
+    const email = uniqueEmail();
+    const administrator = await auth.bootstrapAdministrator(registration(email));
+    const first = await auth.login({ email, password: 'password value' });
+    const second = await auth.login({ email, password: 'password value' });
+
+    assert.equal(await auth.resetAdministratorPassword({
+      email: ` ${email.toUpperCase()} `,
+      password: 'replacement password value',
+    }), true);
+    assert.equal(await auth.resolveSession(first.token), null);
+    assert.equal(await auth.resolveSession(second.token), null);
+    const [credentials] = await pool.execute(
+      'SELECT algorithm, password_hash, password_salt FROM user_credentials WHERE user_id = ?',
+      [administrator.id],
+    );
+    const [sessions] = await pool.execute('SELECT revoked_at FROM sessions WHERE user_id = ?', [administrator.id]);
+    assert.equal(credentials[0].algorithm, 'SCRYPT');
+    assert.equal(credentials[0].password_hash.length, 64);
+    assert.equal(credentials[0].password_salt.length >= 16, true);
+    assert.equal(sessions.every((session) => session.revoked_at !== null), true);
+
+    await assert.rejects(auth.login({ email, password: 'password value' }), { code: 'invalid_credentials' });
+    assert.equal((await auth.login({ email, password: 'replacement password value' })).user.id, administrator.id);
+
+    const user = await auth.register(registration(uniqueEmail()));
+    assert.equal(await auth.resetAdministratorPassword({
+      email: user.email, password: 'replacement password value',
+    }), false);
+    assert.equal((await auth.login({ email: user.email, password: 'password value' })).user.id, user.id);
+  });
+
   it('permits only one initial administrator bootstrap', async (context) => {
     const [existing] = await pool.execute(
       "SELECT user_id FROM user_roles WHERE role_code = 'ADMINISTRADOR' LIMIT 1",

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { createAuthModule, hashPassword } from '../../../src/modules/auth/index.js';
+import { createAuthModule, hashPassword, verifyPassword } from '../../../src/modules/auth/index.js';
 
 const NOW = '2026-09-25T12:00:00.000000Z';
 const TOKEN = 'A'.repeat(43);
@@ -122,6 +122,28 @@ describe('authentication module', () => {
     assert.equal(calls[0][1].now, NOW);
     assert.deepEqual(calls[0][1].tokenHash, calls[1][1].tokenHash);
   });
+
+  it('normalizes the administrator email, validates the new password, and uses a fresh scrypt credential', async () => {
+    let received;
+    const auth = fixture({
+      async resetAdministratorPassword(input) {
+        received = input;
+        return true;
+      },
+    });
+    assert.equal(await auth.resetAdministratorPassword({
+      email: '  ADMIN@EXAMPLE.COM ', password: 'new password value',
+    }), true);
+    assert.equal(received.email, 'admin@example.com');
+    assert.equal(received.now, NOW);
+    assert.equal(received.credential.algorithm, 'SCRYPT');
+    assert.equal(received.credential.hash.length, 64);
+    assert.equal(received.credential.salt.length >= 16, true);
+    assert.equal(await verifyPassword('new password value', received.credential), true);
+    await assert.rejects(auth.resetAdministratorPassword({
+      email: 'admin@example.com', password: 'short',
+    }), { code: 'invalid_request' });
+  });
 });
 
 function fixture(overrides = {}) {
@@ -132,6 +154,7 @@ function fixture(overrides = {}) {
     async findActiveSession() { return null; },
     async revokeSession() {},
     async bootstrapAdministrator() { return USER; },
+    async resetAdministratorPassword() { return false; },
     ...overrides,
   };
   return createAuthModule({

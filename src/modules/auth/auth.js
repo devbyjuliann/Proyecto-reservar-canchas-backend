@@ -8,7 +8,7 @@ import {
   isSessionToken,
   verifyPassword,
 } from './crypto.js';
-import { validateLogin, validateRegistration } from './validation.js';
+import { validateLogin, validatePassword, validateRegistration } from './validation.js';
 
 const SESSION_DURATION_SECONDS = 30 * 24 * 60 * 60;
 const DUMMY_PASSWORD = 'invalid-login-password';
@@ -30,6 +30,7 @@ export function createAuthModule({
     resolveSession,
     revokeSession,
     bootstrapAdministrator,
+    resetAdministratorPassword,
   });
 
   async function register(input) {
@@ -105,6 +106,16 @@ export function createAuthModule({
       }
       throw error;
     }
+  }
+
+  async function resetAdministratorPassword({ email, password }) {
+    const normalizedEmail = validateLogin({ email, password: '' }).email;
+    const credential = await hashPassword(validatePassword(password));
+    return adapter.resetAdministratorPassword({
+      email: normalizedEmail,
+      credential,
+      now: clock.now(),
+    });
   }
 }
 

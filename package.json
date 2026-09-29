@@ -15,7 +15,8 @@
     "db:migrate": "node src/database/migrate-cli.js up",
     "db:migrate:status": "node src/database/migrate-cli.js status",
     "db:migrate:down": "node src/database/migrate-cli.js down",
-    "auth:bootstrap-admin": "node src/modules/auth/bootstrap-admin-cli.js"
+    "auth:bootstrap-admin": "node src/modules/auth/bootstrap-admin-cli.js",
+    "auth:reset-admin-password": "node src/modules/auth/reset-admin-password-cli.js"
   },
   "dependencies": {
     "@js-temporal/polyfill": "^0.5.1",
