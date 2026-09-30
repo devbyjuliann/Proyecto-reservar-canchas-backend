@@ -15,6 +15,7 @@ import { createOwnerApplicationsModule, createMySqlOwnerApplicationsAdapter } fr
 import { createFacilityMembershipsModule, createMySqlFacilityMembershipsAdapter } from './modules/facility-memberships/index.js';
 import { createPublicCatalogModule, createMySqlPublicCatalogAdapter } from './modules/public-catalog/index.js';
 import { createCourtPricingModule, createMySqlCourtPricingAdapter } from './modules/court-pricing/index.js';
+import { createOwnerDirectoryModule, createMySqlOwnerDirectoryAdapter } from './modules/owner-directory/index.js';
 import { createSystemClock } from './shared/clock.js';
 
 export async function startServer() {
@@ -42,6 +43,7 @@ export async function startServer() {
   const pricing = createCourtPricingModule({
     adapter: createMySqlCourtPricingAdapter({ pool }), memberships,
   });
+  const ownerDirectory = createOwnerDirectoryModule({ adapter: createMySqlOwnerDirectoryAdapter({ pool }), clock });
   const app = createApp({
     booking,
     facilities,
@@ -50,6 +52,7 @@ export async function startServer() {
     memberships,
     catalog,
     pricing,
+    ownerDirectory,
     environment: config.environment,
     frontendOrigin: config.frontendOrigin,
     findActiveUserById: (userId) => usersAdapter.findById(userId),

@@ -27,7 +27,7 @@ export function createAdminRouter({ facilities, booking, requireIdentity }) {
   }
 
   const router = Router();
-  router.use(PREFIX, requireIdentity, requireAdministrator, rejectIdempotencyKey);
+  router.use(PREFIX, requireIdentity, requireAdministrator, rejectIdempotencyKey, rejectBusinessMutation);
 
   router.get(`${PREFIX}/facilities`, async (request, response) => {
     response.json(await facilities.listFacilities(input(request, validateStatePageQuery(request.query))));
@@ -68,6 +68,13 @@ export function createAdminRouter({ facilities, booking, requireIdentity }) {
     rejectBody(request);
     const { facilityId } = validateIdRequest('facilityId', request.params.facilityId);
     response.json(await booking.deactivateFacility(input(request, { facilityId })));
+  });
+
+  router.post(`${PREFIX}/facilities/:facilityId/reactivation`, async (request, response) => {
+    validateEmptyQuery(request.query);
+    rejectBody(request);
+    const { facilityId } = validateIdRequest('facilityId', request.params.facilityId);
+    response.json(await facilities.reactivateFacility(input(request, { facilityId })));
   });
 
   router.get(`${PREFIX}/facilities/:facilityId/courts`, async (request, response) => {
@@ -237,6 +244,19 @@ function rejectIdempotencyKey(request, _response, next) {
     next(invalidRequest());
     return;
   }
+  next();
+}
+
+function rejectBusinessMutation(request, _response, next) {
+  const path = request.path;
+  const method = request.method;
+  const businessWrite = (method === 'POST' && (/^\/facilities(?:\/[^/]+\/courts)?$/.test(path)
+    || /^\/courts\/[^/]+\/(?:unavailabilities|deactivation)$/.test(path)))
+    || (method === 'PATCH' && /^\/(?:facilities|courts)\/[^/]+$/.test(path))
+    || (method === 'PUT' && (/^\/facilities\/[^/]+\/booking-policy$/.test(path)
+      || /^\/courts\/[^/]+\/(?:booking-configuration|weekly-schedule|date-exceptions\/[^/]+)$/.test(path)))
+    || (method === 'DELETE' && /^\/courts\/[^/]+\/date-exceptions\/[^/]+$/.test(path));
+  if (businessWrite) return next(appError('forbidden', 'Business operations belong to the owner'));
   next();
 }
 

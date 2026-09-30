@@ -67,7 +67,7 @@ function fixture() {
 const cookie = (identity) => `__Host-reserva_session=${identity}`;
 
 describe('court pricing HTTP contract', () => {
-  it('requires an active owner membership and permits global Administrator operations', async () => {
+  it('requires active owner membership and keeps administrator pricing read-only', async () => {
     const { app, revoke } = fixture();
     await request(app).put(`${OWNER}/60`).set('Origin', ORIGIN)
       .send({ priceMinor: 9000000, currency: 'COP' }).expect(401);
@@ -84,25 +84,25 @@ describe('court pricing HTTP contract', () => {
     await request(app).get(OWNER).set('Cookie', cookie('owner')).expect(404);
     await request(app).put(`${OWNER}/60`).set('Origin', ORIGIN)
       .set('Cookie', cookie('owner')).send({ priceMinor: 9100000, currency: 'COP' }).expect(404);
+    await request(app).get(ADMIN).set('Cookie', cookie('admin')).expect(200);
     await request(app).put(`${ADMIN}/60`).set('Origin', ORIGIN)
-      .set('Cookie', cookie('admin')).send({ priceMinor: 9200000, currency: 'COP' }).expect(200);
+      .set('Cookie', cookie('admin')).send({ priceMinor: 9200000, currency: 'COP' }).expect(403);
     await request(app).delete(`${ADMIN}/60`).set('Origin', ORIGIN)
-      .set('Cookie', cookie('admin')).expect(200)
-      .expect(({ body }) => assert.equal(body.price, null));
+      .set('Cookie', cookie('admin')).expect(403);
   });
 
   it('rejects zero, negative, wrong currency, extra fields, and disallowed durations', async () => {
     const { app } = fixture();
     for (const priceMinor of [0, -1]) {
-      await request(app).put(`${ADMIN}/60`).set('Origin', ORIGIN)
-        .set('Cookie', cookie('admin')).send({ priceMinor, currency: 'COP' }).expect(400);
+      await request(app).put(`${OWNER}/60`).set('Origin', ORIGIN)
+        .set('Cookie', cookie('owner')).send({ priceMinor, currency: 'COP' }).expect(400);
     }
-    await request(app).put(`${ADMIN}/60`).set('Origin', ORIGIN)
-      .set('Cookie', cookie('admin')).send({ priceMinor: 500, currency: 'USD' }).expect(400);
-    await request(app).put(`${ADMIN}/60`).set('Origin', ORIGIN)
-      .set('Cookie', cookie('admin')).send({ priceMinor: 500, currency: 'COP', courtId: '12' }).expect(400);
-    await request(app).put(`${ADMIN}/90`).set('Origin', ORIGIN)
-      .set('Cookie', cookie('admin')).send({ priceMinor: 500, currency: 'COP' }).expect(422)
+    await request(app).put(`${OWNER}/60`).set('Origin', ORIGIN)
+      .set('Cookie', cookie('owner')).send({ priceMinor: 500, currency: 'USD' }).expect(400);
+    await request(app).put(`${OWNER}/60`).set('Origin', ORIGIN)
+      .set('Cookie', cookie('owner')).send({ priceMinor: 500, currency: 'COP', courtId: '12' }).expect(400);
+    await request(app).put(`${OWNER}/90`).set('Origin', ORIGIN)
+      .set('Cookie', cookie('owner')).send({ priceMinor: 500, currency: 'COP' }).expect(422)
       .expect(({ body }) => assert.equal(body.error.code, 'invalid_operational_configuration'));
   });
 

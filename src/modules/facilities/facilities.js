@@ -24,6 +24,7 @@ export function createFacilitiesModule({ adapter, clock }) {
     listCourts,
     getCourt,
     updateCourt,
+    reactivateFacility,
   });
 
   async function listFacilities({ actor, state, limit, cursor, ...unknown } = {}) {
@@ -77,6 +78,13 @@ export function createFacilitiesModule({ adapter, clock }) {
       facility: presentFacility(result.facility),
       operation: operation(result.changed),
     };
+  }
+
+  async function reactivateFacility({ actor, facilityId } = {}) {
+    assertAdministrator(actor);
+    const result = await adapter.reactivateFacility(validateId(facilityId, 'facilityId'));
+    if (!result) throw facilitiesError('resource_not_found');
+    return { facility: presentFacility(result.facility), operation: operation(result.changed) };
   }
 
   async function listCourts({ actor, facilityId, state, limit, cursor, ...unknown } = {}) {

@@ -31,6 +31,7 @@ export const ERROR_STATUS = Object.freeze({
   invalid_owner_application_state: 409,
   membership_conflict: 409,
   facility_not_publishable: 409,
+  owner_suspended: 403,
   invalid_operational_configuration: 422,
   rate_limit_exceeded: 429,
   internal_error: 500,

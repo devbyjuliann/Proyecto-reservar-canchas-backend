@@ -8,6 +8,7 @@ import { createFacilityMembershipsRouter } from '../modules/facility-memberships
 import { createPublicCatalogRouter } from '../modules/public-catalog/index.js';
 import { createCourtPricingRouter } from '../modules/court-pricing/index.js';
 import { createOwnerOperationsRouter } from '../modules/owner/http.js';
+import { createOwnerDirectoryRouter } from '../modules/owner-directory/index.js';
 import { createErrorHandler, notFoundHandler } from './error-handler.js';
 import { createHttpSecurity } from './http-security.js';
 import { createRequestContext } from './request-context.js';
@@ -20,6 +21,7 @@ export function createApp({
   memberships,
   catalog,
   pricing,
+  ownerDirectory,
   findActiveUserById,
   environment,
   frontendOrigin = 'http://localhost:5173',
@@ -40,6 +42,13 @@ export function createApp({
     findActiveUserById,
     resolveSession: auth?.resolveSession,
   });
+  if (ownerDirectory) {
+    app.use('/api/v1/owner', requireIdentity, async (request, _response, next) => {
+      try { await ownerDirectory.requireActiveOwner(request.context.user); next(); }
+      catch (error) { next(error); }
+    });
+    app.use(createOwnerDirectoryRouter({ ownerDirectory, requireIdentity }));
+  }
   if (auth) app.use(createAuthRouter({ auth, environment, requireIdentity }));
   if (ownerApplications) app.use(createOwnerApplicationsRouter({ ownerApplications, requireIdentity }));
   if (memberships) app.use(createFacilityMembershipsRouter({ memberships, requireIdentity }));

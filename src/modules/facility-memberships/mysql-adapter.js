@@ -136,7 +136,7 @@ export function createMySqlFacilityMembershipsAdapter({ pool }) {
     const [rows] = await pool.execute(
       `${FACILITY_SELECT}
        JOIN facility_memberships m ON m.facility_id = f.id
-       JOIN users u ON u.id = m.user_id AND u.deactivated_at IS NULL
+        JOIN users u ON u.id = m.user_id AND u.deactivated_at IS NULL AND u.owner_suspended_at IS NULL
        JOIN user_roles r ON r.user_id = u.id AND r.role_code = 'PROPIETARIO'
        WHERE m.user_id = ? AND m.active = 1${after}
        ORDER BY f.name ASC, f.id ASC LIMIT ?`, values,
@@ -148,7 +148,7 @@ export function createMySqlFacilityMembershipsAdapter({ pool }) {
     const [rows] = await pool.execute(
       `${FACILITY_SELECT}
        JOIN facility_memberships m ON m.facility_id = f.id
-       JOIN users u ON u.id = m.user_id AND u.deactivated_at IS NULL
+        JOIN users u ON u.id = m.user_id AND u.deactivated_at IS NULL AND u.owner_suspended_at IS NULL
        JOIN user_roles r ON r.user_id = u.id AND r.role_code = 'PROPIETARIO'
        WHERE m.user_id = ? AND m.facility_id = ? AND m.active = 1`,
       [userId, facilityId],

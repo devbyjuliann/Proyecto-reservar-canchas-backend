@@ -22,6 +22,10 @@ export function createCourtPricingRouter({ pricing, requireIdentity }) {
       response.json(await pricing.listPrices({ actor: request.context.user,
         courtId: validateIdRequest('courtId', request.params.courtId).courtId, scope }));
     });
+    if (scope === 'admin') {
+      router.use(base, (_request, _response, next) => next(appError('forbidden', 'Business operations belong to the owner')));
+      continue;
+    }
     router.put(`${base}/:durationMinutes`, async (request, response) => {
       validateEmptyQuery(request.query);
       const result = payload.safeParse(request.body);

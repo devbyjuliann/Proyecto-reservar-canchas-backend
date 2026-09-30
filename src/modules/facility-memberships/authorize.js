@@ -5,7 +5,7 @@ import { appError } from '../../shared/errors.js';
 export async function requireActiveMembership(executor, { facilityId, userId, lock = false }) {
   const [rows] = await executor.execute(
     `SELECT m.id FROM facility_memberships m
-     JOIN users u ON u.id = m.user_id AND u.deactivated_at IS NULL
+      JOIN users u ON u.id = m.user_id AND u.deactivated_at IS NULL AND u.owner_suspended_at IS NULL
      JOIN user_roles r ON r.user_id = u.id AND r.role_code = 'PROPIETARIO'
      WHERE m.facility_id = ? AND m.user_id = ? AND m.active = 1
      ${lock ? 'FOR UPDATE' : ''}`,

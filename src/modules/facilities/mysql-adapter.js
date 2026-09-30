@@ -15,6 +15,7 @@ export function createMySqlFacilitiesAdapter({ pool }) {
     listCourts,
     getCourt,
     updateCourt,
+    reactivateFacility,
   });
 
   async function listFacilities({ state, limit, cursor }) {
@@ -46,7 +47,7 @@ export function createMySqlFacilitiesAdapter({ pool }) {
         await connection.beginTransaction();
         const [owners] = await connection.execute(
           `SELECT u.id FROM users u JOIN user_roles r ON r.user_id = u.id
-           WHERE u.id = ? AND u.deactivated_at IS NULL AND r.role_code = 'PROPIETARIO'
+            WHERE u.id = ? AND u.deactivated_at IS NULL AND u.owner_suspended_at IS NULL AND r.role_code = 'PROPIETARIO'
            FOR UPDATE`, [ownerUserId],
         );
         if (!owners.length) throw facilitiesError('forbidden');
@@ -106,6 +107,15 @@ export function createMySqlFacilitiesAdapter({ pool }) {
       [facilityId],
     );
     return rows.length === 0 ? null : mapFacility(rows[0]);
+  }
+
+  async function reactivateFacility(facilityId) {
+    const [result] = await pool.execute(
+      'UPDATE facilities SET deactivated_at = NULL WHERE id = ? AND deactivated_at IS NOT NULL',
+      [facilityId],
+    );
+    const facility = await getFacility(facilityId);
+    return facility ? { facility, changed: result.affectedRows === 1 } : null;
   }
 
   async function updateFacility({ facilityId, input, ownerUserId }) {

@@ -45,7 +45,8 @@ describe('facilities catalog module', () => {
       'updateFacility',
       'listCourts',
       'getCourt',
-      'updateCourt',
+       'updateCourt',
+       'reactivateFacility',
     ]);
   });
 

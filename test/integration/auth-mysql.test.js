@@ -135,7 +135,8 @@ describe('authentication MySQL integration', { skip: !MYSQL_AVAILABLE, timeout: 
 
   it('resets only an administrator credential with scrypt and revokes every active session', async () => {
     const email = uniqueEmail();
-    const administrator = await auth.bootstrapAdministrator(registration(email));
+    const administrator = await auth.register(registration(email));
+    await pool.execute("INSERT INTO user_roles (user_id, role_code) VALUES (?, 'ADMINISTRADOR')", [administrator.id]);
     const first = await auth.login({ email, password: 'password value' });
     const second = await auth.login({ email, password: 'password value' });
 
