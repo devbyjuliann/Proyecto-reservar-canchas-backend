@@ -270,7 +270,7 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
 
       const booking = await loadBooking(connection, bookingId);
       if (!booking) throw bookingError('internal_error');
-      return { booking, now };
+      return { booking, now, changed: action === 'cancel' };
     });
   }
 

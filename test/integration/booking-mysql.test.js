@@ -10,13 +10,16 @@ import {
 } from 'node:test';
 
 import { Temporal } from '@js-temporal/polyfill';
+import request from 'supertest';
 
+import { createApp } from '../../src/app/create-app.js';
 import { loadDatabaseConfig } from '../../src/config/database.js';
 import { createMigrator } from '../../src/database/migrator.js';
 import { createMigrationConnection } from '../../src/database/mysql.js';
 import { createMySqlPool } from '../../src/database/pool.js';
 import {
   createBookingModule,
+  createBookingEmailNotifier,
   createMySqlBookingAdapter,
 } from '../../src/modules/booking/index.js';
 import { createSystemClock } from '../../src/shared/clock.js';
@@ -322,6 +325,71 @@ describe('booking MySQL integration', { skip: !MYSQL_AVAILABLE, timeout: 30_000 
     );
     assert.match(rows[0].cancelled_at, /\.\d{6}$/);
   });
+
+  it('emails the client once per real transition, using the original price after a tariff change', async () => {
+    await pool.execute('UPDATE court_prices SET price_amount_minor = 5000000 WHERE court_id = ?', [fixture.courtId]);
+    const sent = [];
+    const notifications = createBookingEmailNotifier({
+      sendEmail: async (message) => { sent.push(message); }, frontendOrigin: 'https://canchapp.online',
+    });
+    const withEmail = createBookingModule({ adapter, clock: createSystemClock(), notifications });
+    const actor = { id: fixture.userIds[0], email: fixture.userEmails[0] };
+    const bookingRequest = { ...fixture.request, expectedPriceMinor: 5000000 };
+    const first = await withEmail.confirmBooking({ actor, request: bookingRequest, idempotencyKey: 'email-replay' });
+    assert.equal(first.replayed, false);
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].type, 'booking-confirmation');
+    assert.equal(sent[0].email, actor.email);
+    const localDate = new Intl.DateTimeFormat('es-CO', { day: 'numeric', month: 'long', year: 'numeric',
+      timeZone: 'America/Bogota' }).format(new Date(first.booking.startAt));
+    assert.ok(sent[0].text.includes(localDate));
+    assert.ok(sent[0].text.includes('12:00 - 13:00'));
+    assert.ok(sent[0].text.includes('$50.000 COP'));
+    const replay = await withEmail.confirmBooking({ actor, request: bookingRequest, idempotencyKey: 'email-replay' });
+    assert.equal(replay.replayed, true);
+    assert.equal(sent.length, 1);
+
+    await pool.execute('UPDATE court_prices SET price_amount_minor = 6000000 WHERE court_id = ?', [fixture.courtId]);
+    const cancelled = await withEmail.cancelBooking({ actor, bookingId: first.booking.id });
+    assert.equal(cancelled.booking.status, 'CANCELADA');
+    await withEmail.cancelBooking({ actor, bookingId: first.booking.id });
+    assert.equal(sent.length, 2);
+    assert.equal(sent[1].type, 'booking-cancellation');
+    assert.ok(sent[1].text.includes('$50.000 COP'));
+    assert.equal(sent[1].text.includes('$60.000 COP'), false);
+    const [rows] = await pool.execute('SELECT status, price_amount_minor FROM bookings WHERE id = ?', [first.booking.id]);
+    assert.equal(rows[0].status, 'CANCELADA');
+    assert.equal(Number(rows[0].price_amount_minor), 5000000);
+  });
+
+  it('keeps HTTP confirmation and cancellation successful when the provider fails after commit', async () => {
+    const errors = [];
+    const notifications = createBookingEmailNotifier({
+      sendEmail: async () => { throw new Error('Sensitive provider failure'); },
+      frontendOrigin: 'https://canchapp.online',
+    });
+    const withEmail = createBookingModule({ adapter, clock: createSystemClock(), notifications,
+      logger: { error: (message) => { errors.push(message); } } });
+    const app = createApp({ environment: 'test', frontendOrigin: 'http://localhost:5173', booking: withEmail,
+      findActiveUserById: async (id) => id === fixture.userIds[0]
+        ? { id, name: 'Integration one', email: fixture.userEmails[0], roles: ['USUARIO'] } : null,
+      logger: { error: (message) => { errors.push(message); } } });
+    const confirmed = await request(app).post('/api/v1/bookings')
+      .set('X-User-Id', fixture.userIds[0]).set('Idempotency-Key', 'email-provider-fails')
+      .send(fixture.request).expect(201);
+    const bookingId = confirmed.body.booking.id;
+    const [before] = await pool.execute('SELECT status FROM bookings WHERE id = ?', [bookingId]);
+    assert.equal(before[0].status, 'CONFIRMADA');
+    const cancelled = await request(app).post(`/api/v1/bookings/${bookingId}/cancellation`)
+      .set('X-User-Id', fixture.userIds[0]).expect(200);
+    assert.equal(cancelled.body.booking.status, 'CANCELADA');
+    const [after] = await pool.execute('SELECT status FROM bookings WHERE id = ?', [bookingId]);
+    assert.equal(after[0].status, 'CANCELADA');
+    assert.deepEqual(errors, [
+      'Booking confirmation email delivery failed', 'Booking cancellation email delivery failed',
+    ]);
+    assert.equal(errors.join(' ').includes('Sensitive provider failure'), false);
+  });
 });
 
 async function seedFixture(pool) {
@@ -329,12 +397,15 @@ async function seedFixture(pool) {
   try {
     await connection.beginTransaction();
     const userIds = [];
+    const userEmails = [];
     for (const suffix of ['one', 'two']) {
+      const email = `${randomUUID()}@example.com`;
       const [user] = await connection.execute(
         'INSERT INTO users (name, email) VALUES (?, ?)',
-        [`Integration ${suffix}`, `${randomUUID()}@example.com`],
+        [`Integration ${suffix}`, email],
       );
       userIds.push(String(user.insertId));
+      userEmails.push(email);
     }
     const [facility] = await connection.execute(
       `INSERT INTO facilities
@@ -371,6 +442,7 @@ async function seedFixture(pool) {
     await connection.commit();
     return {
       userIds,
+      userEmails,
       facilityId,
       courtId,
       request: {

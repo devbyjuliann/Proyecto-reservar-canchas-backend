@@ -9,7 +9,7 @@ import {
   verifyPassword,
 } from './crypto.js';
 import { validateLogin, validatePassword, validateRegistration } from './validation.js';
-import { validateResetConfirm, validateResetRequest } from './validation.js';
+import { validateGoogleCredential, validateResetConfirm, validateResetRequest } from './validation.js';
 
 const SESSION_DURATION_SECONDS = 30 * 24 * 60 * 60;
 const RESET_DURATION_SECONDS = 30 * 60;
@@ -21,6 +21,7 @@ export function createAuthModule({
   generateToken = createRandomSessionToken,
   sendPasswordResetEmail,
   frontendOrigin,
+  verifyGoogleCredential,
 }) {
   if (!adapter || typeof clock?.now !== 'function') {
     throw new TypeError('An auth adapter and clock are required');
@@ -37,6 +38,8 @@ export function createAuthModule({
     resetAdministratorPassword,
     requestPasswordReset,
     confirmPasswordReset,
+    loginWithGoogle,
+    linkGoogle,
   });
 
   async function register(input) {
@@ -63,10 +66,14 @@ export function createAuthModule({
     const account = await adapter.findAccountByEmail(attempt.email);
     const credential = account?.credential ?? await dummyCredentialPromise;
     const passwordMatches = await verifyPassword(attempt.password, credential);
-    if (!account || !passwordMatches || account.deactivatedAt !== null) {
+    if (!account?.credential || !passwordMatches || account.deactivatedAt !== null) {
       throw invalidCredentials();
     }
 
+    return createLocalSession(account.user);
+  }
+
+  async function createLocalSession(user) {
     const token = generateToken();
     if (!isSessionToken(token)) throw new Error('Session token generator returned an invalid token');
     const now = clock.now();
@@ -74,13 +81,63 @@ export function createAuthModule({
       .add({ seconds: SESSION_DURATION_SECONDS })
       .toString({ fractionalSecondDigits: 6 });
     const session = await adapter.createSession({
-      userId: account.user.id,
+      userId: user.id,
       tokenHash: hashSessionToken(token),
       now,
       expiresAt,
     });
     if (!session) throw invalidCredentials();
-    return { user: account.user, sessionId: session.id, token, expiresAt };
+    return { user, sessionId: session.id, token, expiresAt };
+  }
+
+  async function verifiedGoogleProfile(input) {
+    const credential = validateGoogleCredential(input);
+    if (!verifyGoogleCredential) throw appError('google_not_configured', 'Google sign-in is unavailable');
+    let claims;
+    try { claims = await verifyGoogleCredential(credential); }
+    catch { throw appError('invalid_google_credential', 'Google sign-in failed'); }
+    let email;
+    try { email = validateLogin({ email: claims?.email, password: '' }).email; }
+    catch { throw appError('invalid_google_credential', 'Google sign-in failed'); }
+    if (claims.email_verified !== true || typeof claims.sub !== 'string'
+      || !/^[A-Za-z0-9_-]{1,255}$/.test(claims.sub)) {
+      throw appError('invalid_google_credential', 'Google sign-in failed');
+    }
+    const domain = email.split('@')[1];
+    const hostedDomain = typeof claims.hd === 'string' ? claims.hd.toLowerCase() : '';
+    const allowAutoLink = domain === 'gmail.com'
+      || (hostedDomain !== '' && domain === hostedDomain && /^[a-z0-9.-]+$/.test(hostedDomain));
+    const name = typeof claims.name === 'string' && claims.name.trim()
+      ? claims.name.trim().slice(0, 150) : email.split('@')[0].slice(0, 150);
+    return { subject: claims.sub, email, name, allowAutoLink };
+  }
+
+  async function loginWithGoogle(input) {
+    const profile = await verifiedGoogleProfile(input);
+    const result = await adapter.resolveGoogleIdentity({ ...profile, now: clock.now() });
+    if (result === 'link_required') {
+      throw appError('google_link_requires_confirmation', 'Sign in with your password to link Google');
+    }
+    if (result === 'inactive') throw invalidCredentials();
+    if (!result) throw appError('google_identity_conflict', 'Google sign-in is unavailable for this account');
+    return createLocalSession(result);
+  }
+
+  async function linkGoogle({ actor, sessionId, sessionCreatedAt, ...input }) {
+    if (!sessionId || !actor?.id) throw appError('authentication_required', 'A local session is required');
+    let age;
+    try { age = Temporal.Instant.from(sessionCreatedAt).until(clock.now()).total('minutes'); }
+    catch { throw appError('google_link_requires_recent_login', 'Sign in again before linking Google'); }
+    if (age < 0 || age > 15) {
+      throw appError('google_link_requires_recent_login', 'Sign in again before linking Google');
+    }
+    const profile = await verifiedGoogleProfile(input);
+    const linked = await adapter.linkGoogleIdentity({ userId: String(actor.id), sessionId, ...profile, now: clock.now() });
+    if (linked === 'session_inactive') {
+      throw appError('google_link_requires_recent_login', 'Sign in again before linking Google');
+    }
+    if (!linked) throw appError('google_identity_conflict', 'Google identity cannot be linked');
+    return linked;
   }
 
   async function resolveSession(token) {
@@ -131,7 +188,7 @@ export function createAuthModule({
     }
     const account = await adapter.findAccountByEmail(email);
     await hashPassword(DUMMY_PASSWORD);
-    if (!account || account.deactivatedAt !== null) {
+    if (!account?.credential || account.deactivatedAt !== null) {
       return;
     }
     const token = generateToken();

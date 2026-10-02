@@ -39,6 +39,7 @@ const resetConfirmSchema = z.object({
   token: z.string().max(128),
   newPassword: passwordSchema,
 }).strict();
+const googleSchema = z.object({ credential: z.string().min(1).max(8192) }).strict();
 
 export function validateRegistration(input) {
   return parse(registrationSchema, input);
@@ -58,6 +59,10 @@ export function validateResetRequest(input) {
 
 export function validateResetConfirm(input) {
   return parse(resetConfirmSchema, input);
+}
+
+export function validateGoogleCredential(input) {
+  return parse(googleSchema, input).credential;
 }
 
 function parse(schema, input) {

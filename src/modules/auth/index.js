@@ -2,6 +2,7 @@ export { createAuthModule } from './auth.js';
 export { createAuthRouter } from './http.js';
 export { createMySqlAuthAdapter } from './mysql-adapter.js';
 export { createPasswordResetMailer } from './password-reset-mailer.js';
+export { createGoogleVerifier } from './google-verifier.js';
 export { readSessionCookie, sessionCookieName, sessionCookieOptions } from './session-cookie.js';
 export {
   generateSessionToken,

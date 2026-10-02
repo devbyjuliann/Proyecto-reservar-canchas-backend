@@ -17,6 +17,7 @@ export function createRequestContext({ environment, findActiveUserById, resolveS
             user: session.user,
             roles: Object.freeze([...session.user.roles]),
             sessionId: session.sessionId,
+            sessionCreatedAt: session.sessionCreatedAt,
           });
           next();
           return;
@@ -35,6 +36,7 @@ export function createRequestContext({ environment, findActiveUserById, resolveS
         user,
         roles: Object.freeze([...user.roles]),
         sessionId: null,
+        sessionCreatedAt: null,
       });
       next();
     } catch (error) {

@@ -13,7 +13,7 @@ describe('password reset orchestration', () => {
       adapter: {
         async findAccountByEmail(email) {
           assert.equal(email, 'user@example.test');
-          return { user: { id: '3', email }, deactivatedAt: null };
+          return { user: { id: '3', email }, credential: { algorithm: 'SCRYPT' }, deactivatedAt: null };
         },
         async issuePasswordReset(value) { issued.push(value); return true; },
       },

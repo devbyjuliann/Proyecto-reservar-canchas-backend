@@ -6,9 +6,10 @@ import { loadAppConfig } from './config/app.js';
 import { createMySqlPool } from './database/pool.js';
 import {
   createBookingModule,
+  createBookingEmailNotifier,
   createMySqlBookingAdapter,
 } from './modules/booking/index.js';
-import { createAuthModule, createMySqlAuthAdapter, createPasswordResetMailer } from './modules/auth/index.js';
+import { createAuthModule, createGoogleVerifier, createMySqlAuthAdapter, createPasswordResetMailer } from './modules/auth/index.js';
 import { createMySqlUsersAdapter } from './modules/users/index.js';
 import { createFacilitiesModule, createMySqlFacilitiesAdapter } from './modules/facilities/index.js';
 import { createOwnerApplicationsModule, createMySqlOwnerApplicationsAdapter } from './modules/owner-applications/index.js';
@@ -17,10 +18,12 @@ import { createPublicCatalogModule, createMySqlPublicCatalogAdapter } from './mo
 import { createCourtPricingModule, createMySqlCourtPricingAdapter } from './modules/court-pricing/index.js';
 import { createOwnerDirectoryModule, createMySqlOwnerDirectoryAdapter } from './modules/owner-directory/index.js';
 import { createSystemClock } from './shared/clock.js';
+import { createEmailTransport } from './shared/email-transport.js';
 
 export async function startServer() {
   const config = loadAppConfig();
-  const sendPasswordResetEmail = createPasswordResetMailer({ environment: config.environment });
+  const sendEmail = createEmailTransport({ environment: config.environment });
+  const sendPasswordResetEmail = createPasswordResetMailer({ sendEmail });
   const pool = createMySqlPool();
   const usersAdapter = createMySqlUsersAdapter({ pool });
   const catalogAdapter = createMySqlPublicCatalogAdapter({ pool });
@@ -29,10 +32,13 @@ export async function startServer() {
   const auth = createAuthModule({
     adapter: createMySqlAuthAdapter({ pool }), clock, frontendOrigin: config.frontendOrigin,
     sendPasswordResetEmail,
+    verifyGoogleCredential: createGoogleVerifier({ clientId: process.env.GOOGLE_CLIENT_ID,
+      environment: config.environment, testSecret: process.env.AUTH_TEST_GOOGLE_SECRET }),
   });
   const booking = createBookingModule({
     adapter: bookingAdapter,
     clock,
+    notifications: createBookingEmailNotifier({ sendEmail, frontendOrigin: config.frontendOrigin }),
   });
   const facilities = createFacilitiesModule({ adapter: createMySqlFacilitiesAdapter({ pool }), clock });
   const ownerApplications = createOwnerApplicationsModule({

@@ -19,7 +19,7 @@ const REJECTION_CODES = Object.freeze({
   OUTSIDE_BOOKING_WINDOW: 'option_not_available',
 });
 
-export function createBookingModule({ adapter, clock }) {
+export function createBookingModule({ adapter, clock, notifications, logger = console }) {
   if (!adapter) throw new TypeError('A booking adapter is required');
   if (typeof clock?.now !== 'function') throw new TypeError('A clock is required');
 
@@ -123,7 +123,9 @@ export function createBookingModule({ adapter, clock }) {
     if (result.kind === 'rejected') throw bookingError(result.code, result.code === 'booking_price_changed'
       ? { details: { currentPriceMinor: result.currentPriceMinor ?? null, currency: 'COP' } }
       : undefined);
-    return { booking: presentBooking(result.booking, result.now), replayed: result.replayed };
+    const booking = presentBooking(result.booking, result.now);
+    if (!result.replayed) await notify('confirmation', actor, booking);
+    return { booking, replayed: result.replayed };
   }
 
   async function listOwnBookings({ actor, limit, cursor }) {
@@ -201,7 +203,19 @@ export function createBookingModule({ adapter, clock }) {
       },
     });
     if (!result) throw bookingError('resource_not_found');
-    return { booking: presentBooking(result.booking, result.now) };
+    const booking = presentBooking(result.booking, result.now);
+    if (result.changed) await notify('cancellation', actor, booking);
+    return { booking };
+  }
+
+  async function notify(kind, actor, booking) {
+    if (!notifications?.[kind]) return;
+    try {
+      if (!actor?.email) throw new Error('Recipient unavailable');
+      await notifications[kind]({ email: actor.email, booking });
+    } catch {
+      logger.error?.(`Booking ${kind} email delivery failed`);
+    }
   }
 
   async function replaceFacilityBookingPolicy({ actor, facilityId, policy, ...input }) {

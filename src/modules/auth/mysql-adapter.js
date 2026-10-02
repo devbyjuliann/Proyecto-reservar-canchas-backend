@@ -18,6 +18,8 @@ export function createMySqlAuthAdapter({ pool }) {
     issuePasswordReset,
     invalidatePasswordReset,
     consumePasswordReset,
+    resolveGoogleIdentity,
+    linkGoogleIdentity,
   });
 
   async function register({ name, email, credential, now }) {
@@ -48,7 +50,7 @@ export function createMySqlAuthAdapter({ pool }) {
               c.scrypt_cost, c.scrypt_block_size, c.scrypt_parallelization,
               ur.role_code
        FROM users AS u
-       JOIN user_credentials AS c ON c.user_id = u.id
+       LEFT JOIN user_credentials AS c ON c.user_id = u.id
        LEFT JOIN user_roles AS ur ON ur.user_id = u.id
        WHERE u.email = ?
        ORDER BY ur.role_code`,
@@ -61,7 +63,7 @@ export function createMySqlAuthAdapter({ pool }) {
       deactivatedAt: rows[0].deactivated_at === null
         ? null
         : toInstantString(rows[0].deactivated_at),
-      credential: mapCredential(rows[0]),
+      credential: rows[0].password_hash == null ? null : mapCredential(rows[0]),
     };
   }
 
@@ -79,7 +81,8 @@ export function createMySqlAuthAdapter({ pool }) {
 
   async function findActiveSession({ tokenHash, now }) {
     const [rows] = await pool.execute(
-      `SELECT s.id AS session_id, u.id, u.name, u.email, u.created_at, ur.role_code
+      `SELECT s.id AS session_id, s.created_at AS session_created_at,
+              u.id, u.name, u.email, u.created_at, ur.role_code
        FROM sessions AS s
        JOIN users AS u ON u.id = s.user_id
        LEFT JOIN user_roles AS ur ON ur.user_id = u.id
@@ -91,7 +94,8 @@ export function createMySqlAuthAdapter({ pool }) {
       [tokenHash, toMySqlDateTime(now)],
     );
     if (rows.length === 0) return null;
-    return { sessionId: String(rows[0].session_id), user: mapUserRows(rows) };
+    return { sessionId: String(rows[0].session_id),
+      sessionCreatedAt: toInstantString(rows[0].session_created_at), user: mapUserRows(rows) };
   }
 
   async function revokeSession({ tokenHash, now }) {
@@ -262,6 +266,114 @@ export function createMySqlAuthAdapter({ pool }) {
     } catch (error) { await connection.rollback(); throw error; }
     finally { connection.release(); }
   }
+
+  async function resolveGoogleIdentity({ subject, email, name, allowAutoLink, now }) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const connection = await pool.getConnection();
+      try {
+        await connection.beginTransaction();
+        const [linked] = await connection.execute(
+          "SELECT user_id FROM user_external_identities WHERE provider = 'GOOGLE' AND provider_subject = ?",
+          [subject],
+        );
+        let userId;
+        if (linked.length) {
+          userId = linked[0].user_id;
+          const [users] = await connection.execute('SELECT id, deactivated_at FROM users WHERE id = ? FOR UPDATE', [userId]);
+          if (!users.length || users[0].deactivated_at != null) { await connection.rollback(); return 'inactive'; }
+        } else {
+          const [users] = await connection.execute(
+            'SELECT id, deactivated_at FROM users WHERE email = ? FOR UPDATE', [email],
+          );
+          if (users.length) {
+            if (users[0].deactivated_at != null) { await connection.rollback(); return 'inactive'; }
+            // A concurrent creator may have committed while this SELECT waited on the user lock.
+            const [justLinked] = await connection.execute(
+              "SELECT user_id FROM user_external_identities WHERE provider = 'GOOGLE' AND provider_subject = ?",
+              [subject],
+            );
+            if (justLinked.length) {
+              if (String(justLinked[0].user_id) !== String(users[0].id)) { await connection.rollback(); return null; }
+              const user = await loadGoogleUser(connection, users[0].id);
+              await connection.commit();
+              return user;
+            }
+            if (!allowAutoLink) { await connection.rollback(); return 'link_required'; }
+            userId = users[0].id;
+            const [existing] = await connection.execute(
+              "SELECT id FROM user_external_identities WHERE user_id = ? AND provider = 'GOOGLE'", [userId],
+            );
+            if (existing.length) { await connection.rollback(); return null; }
+          } else {
+            const [insert] = await connection.execute(
+              'INSERT INTO users (name, email, created_at) VALUES (?, ?, ?)',
+              [name, email, toMySqlDateTime(now)],
+            );
+            userId = insert.insertId;
+            await connection.execute("INSERT INTO user_roles (user_id, role_code) VALUES (?, 'USUARIO')", [userId]);
+          }
+          await connection.execute(
+            "INSERT INTO user_external_identities (user_id, provider, provider_subject, created_at) VALUES (?, 'GOOGLE', ?, ?)",
+            [userId, subject, toMySqlDateTime(now)],
+          );
+        }
+        const user = await loadGoogleUser(connection, userId);
+        await connection.commit();
+        return user;
+      } catch (error) {
+        await connection.rollback();
+        if (['ER_DUP_ENTRY', 'ER_LOCK_DEADLOCK', 'ER_LOCK_WAIT_TIMEOUT'].includes(error?.code) && attempt < 2) continue;
+        if (error?.code === 'ER_DUP_ENTRY') return null;
+        throw error;
+      } finally { connection.release(); }
+    }
+    return null;
+  }
+
+  async function linkGoogleIdentity({ userId, sessionId, subject, email, now }) {
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [users] = await connection.execute(
+        'SELECT id, email FROM users WHERE id = ? AND deactivated_at IS NULL FOR UPDATE', [userId],
+      );
+      if (!users.length || users[0].email !== email) { await connection.rollback(); return null; }
+      const [sessions] = await connection.execute(
+        `SELECT id FROM sessions WHERE id = ? AND user_id = ?
+         AND revoked_at IS NULL AND expires_at > ? FOR UPDATE`,
+        [sessionId, userId, toMySqlDateTime(now)],
+      );
+      if (!sessions.length) { await connection.rollback(); return 'session_inactive'; }
+      const [existing] = await connection.execute(
+        "SELECT user_id, provider_subject FROM user_external_identities WHERE provider = 'GOOGLE' AND (user_id = ? OR provider_subject = ?) FOR UPDATE",
+        [userId, subject],
+      );
+      if (existing.some((row) => String(row.user_id) !== String(userId) || row.provider_subject !== subject)) {
+        await connection.rollback(); return null;
+      }
+      if (!existing.length) {
+        await connection.execute(
+          "INSERT INTO user_external_identities (user_id, provider, provider_subject, created_at) VALUES (?, 'GOOGLE', ?, ?)",
+          [userId, subject, toMySqlDateTime(now)],
+        );
+      }
+      const user = await loadGoogleUser(connection, userId);
+      await connection.commit();
+      return user;
+    } catch (error) {
+      await connection.rollback();
+      if (error?.code === 'ER_DUP_ENTRY') return null;
+      throw error;
+    } finally { connection.release(); }
+  }
+}
+
+async function loadGoogleUser(connection, userId) {
+  const [rows] = await connection.execute(
+    `SELECT u.id, u.name, u.email, u.created_at, ur.role_code FROM users u
+     LEFT JOIN user_roles ur ON ur.user_id = u.id WHERE u.id = ? ORDER BY ur.role_code`, [userId],
+  );
+  return mapUserRows(rows);
 }
 
 async function insertUserWithCredential(connection, { name, email, credential, now, roles }) {

@@ -7,6 +7,7 @@ import {
   sessionCookieName,
   sessionCookieOptions,
 } from './session-cookie.js';
+import { validateGoogleCredential } from './validation.js';
 
 function authRateLimit(windowMs, limit) {
   return rateLimit({
@@ -43,6 +44,8 @@ export function createAuthRouter({ auth, environment, requireIdentity }) {
     testRateLimit('AUTH_TEST_RESET_REQUEST_LIMIT', 5, environment));
   const resetConfirmLimit = authRateLimit(15 * 60 * 1000,
     testRateLimit('AUTH_TEST_RESET_CONFIRM_LIMIT', 10, environment));
+  const googleLimit = authRateLimit(15 * 60 * 1000,
+    testRateLimit('AUTH_TEST_GOOGLE_LIMIT', 10, environment));
 
   router.post('/api/v1/auth/registrations', registrationLimit, async (request, response) => {
     const user = await auth.register(request.body);
@@ -51,13 +54,30 @@ export function createAuthRouter({ auth, environment, requireIdentity }) {
 
   router.post('/api/v1/auth/sessions', loginLimit, async (request, response) => {
     const result = await auth.login(request.body);
+    setSessionCookie(response, environment, result);
+    response.json({ user: presentUser(result.user) });
+  });
+
+  router.post('/api/v1/auth/google', googleLimit, async (request, response) => {
+    const result = await auth.loginWithGoogle(request.body);
+    setSessionCookie(response, environment, result);
+    response.json({ user: presentUser(result.user) });
+  });
+
+  router.post('/api/v1/auth/google/link', googleLimit, requireIdentity, async (request, response) => {
+    const credential = validateGoogleCredential(request.body);
+    const user = await auth.linkGoogle({ credential, actor: request.context.user,
+      sessionId: request.context.sessionId, sessionCreatedAt: request.context.sessionCreatedAt });
+    response.json({ user: presentUser(user) });
+  });
+
+  function setSessionCookie(response, environment, result) {
     response.cookie(
       sessionCookieName(environment),
       result.token,
       sessionCookieOptions(environment, result.expiresAt),
     );
-    response.json({ user: presentUser(result.user) });
-  });
+  }
 
   router.post('/api/v1/auth/password-reset/request', resetRequestLimit, async (request, response) => {
     await auth.requestPasswordReset(request.body);
