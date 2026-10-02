@@ -11,6 +11,7 @@ export const ERROR_STATUS = Object.freeze({
   invalid_request: 400,
   authentication_required: 401,
   invalid_credentials: 401,
+  invalid_password_reset_token: 400,
   forbidden: 403,
   origin_not_allowed: 403,
   resource_not_found: 404,

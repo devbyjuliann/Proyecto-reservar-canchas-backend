@@ -9,14 +9,18 @@ import {
   verifyPassword,
 } from './crypto.js';
 import { validateLogin, validatePassword, validateRegistration } from './validation.js';
+import { validateResetConfirm, validateResetRequest } from './validation.js';
 
 const SESSION_DURATION_SECONDS = 30 * 24 * 60 * 60;
+const RESET_DURATION_SECONDS = 30 * 60;
 const DUMMY_PASSWORD = 'invalid-login-password';
 
 export function createAuthModule({
   adapter,
   clock,
   generateToken = createRandomSessionToken,
+  sendPasswordResetEmail,
+  frontendOrigin,
 }) {
   if (!adapter || typeof clock?.now !== 'function') {
     throw new TypeError('An auth adapter and clock are required');
@@ -31,6 +35,8 @@ export function createAuthModule({
     revokeSession,
     bootstrapAdministrator,
     resetAdministratorPassword,
+    requestPasswordReset,
+    confirmPasswordReset,
   });
 
   async function register(input) {
@@ -116,6 +122,50 @@ export function createAuthModule({
       credential,
       now: clock.now(),
     });
+  }
+
+  async function requestPasswordReset(input) {
+    const { email } = validateResetRequest(input);
+    if (typeof sendPasswordResetEmail !== 'function' || !frontendOrigin) {
+      throw new Error('Password reset mailer and frontend origin are required');
+    }
+    const account = await adapter.findAccountByEmail(email);
+    await hashPassword(DUMMY_PASSWORD);
+    if (!account || account.deactivatedAt !== null) {
+      return;
+    }
+    const token = generateToken();
+    if (!isSessionToken(token)) throw new Error('Password reset token generator returned an invalid token');
+    const now = clock.now();
+    const expiresAt = Temporal.Instant.from(now).add({ seconds: RESET_DURATION_SECONDS })
+      .toString({ fractionalSecondDigits: 6 });
+    const tokenHash = hashSessionToken(token);
+    let created;
+    try {
+      created = await adapter.issuePasswordReset({ userId: account.user.id, tokenHash, now, expiresAt });
+    } catch {
+      // Do not expose account existence through an issuance failure.
+      return;
+    }
+    if (!created) return;
+    const resetUrl = new URL('/reset-password', frontendOrigin);
+    resetUrl.searchParams.set('token', token);
+    try {
+      await sendPasswordResetEmail({ email: account.user.email, resetUrl: resetUrl.toString(), expiresAt });
+    } catch {
+      try { await adapter.invalidatePasswordReset({ tokenHash, now: clock.now() }); } catch { /* No public disclosure. */ }
+      // The public response remains the same for an address with or without an account.
+    }
+  }
+
+  async function confirmPasswordReset(input) {
+    const { token, newPassword } = validateResetConfirm(input);
+    if (!isSessionToken(token)) throw appError('invalid_password_reset_token', 'The reset link is invalid or expired');
+    const credential = await hashPassword(newPassword);
+    const changed = await adapter.consumePasswordReset({
+      tokenHash: hashSessionToken(token), credential, now: clock.now(),
+    });
+    if (!changed) throw appError('invalid_password_reset_token', 'The reset link is invalid or expired');
   }
 }
 

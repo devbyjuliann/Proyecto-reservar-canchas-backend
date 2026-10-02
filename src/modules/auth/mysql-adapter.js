@@ -15,6 +15,9 @@ export function createMySqlAuthAdapter({ pool }) {
     revokeSession,
     bootstrapAdministrator,
     resetAdministratorPassword,
+    issuePasswordReset,
+    invalidatePasswordReset,
+    consumePasswordReset,
   });
 
   async function register({ name, email, credential, now }) {
@@ -185,6 +188,79 @@ export function createMySqlAuthAdapter({ pool }) {
     } finally {
       connection.release();
     }
+  }
+
+  async function issuePasswordReset({ userId, tokenHash, now, expiresAt }) {
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [users] = await connection.execute(
+        'SELECT id FROM users WHERE id = ? AND deactivated_at IS NULL FOR UPDATE', [userId],
+      );
+      if (!users.length) { await connection.rollback(); return false; }
+      const timestamp = toMySqlDateTime(now);
+      await connection.execute(
+        'UPDATE password_reset_tokens SET consumed_at = GREATEST(?, created_at) WHERE user_id = ? AND consumed_at IS NULL',
+        [timestamp, userId],
+      );
+      await connection.execute(
+        'INSERT INTO password_reset_tokens (user_id, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?)',
+        [userId, tokenHash, timestamp, toMySqlDateTime(expiresAt)],
+      );
+      await connection.commit();
+      return true;
+    } catch (error) { await connection.rollback(); throw error; }
+    finally { connection.release(); }
+  }
+
+  async function invalidatePasswordReset({ tokenHash, now }) {
+    await pool.execute(
+      'UPDATE password_reset_tokens SET consumed_at = ? WHERE token_hash = ? AND consumed_at IS NULL',
+      [toMySqlDateTime(now), tokenHash],
+    );
+  }
+
+  async function consumePasswordReset({ tokenHash, credential, now }) {
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [tokens] = await connection.execute(
+        'SELECT user_id FROM password_reset_tokens WHERE token_hash = ?', [tokenHash],
+      );
+      if (!tokens.length) { await connection.rollback(); return false; }
+      const userId = tokens[0].user_id;
+      // Both issuing and consuming lock the user before touching token rows.
+      const [users] = await connection.execute(
+        'SELECT id FROM users WHERE id = ? AND deactivated_at IS NULL FOR UPDATE', [userId],
+      );
+      if (!users.length) { await connection.rollback(); return false; }
+      const timestamp = toMySqlDateTime(now);
+      const [consumed] = await connection.execute(
+        `UPDATE password_reset_tokens SET consumed_at = ?
+         WHERE token_hash = ? AND user_id = ? AND consumed_at IS NULL AND expires_at > ?`,
+        [timestamp, tokenHash, userId, timestamp],
+      );
+      if (!consumed.affectedRows) { await connection.rollback(); return false; }
+      await connection.execute(
+        `UPDATE user_credentials
+         SET password_hash = ?, password_salt = ?, algorithm = ?, scrypt_cost = ?,
+             scrypt_block_size = ?, scrypt_parallelization = ?, updated_at = ?
+         WHERE user_id = ?`,
+        [credential.hash, credential.salt, credential.algorithm, credential.parameters.cost,
+          credential.parameters.blockSize, credential.parameters.parallelization, timestamp, userId],
+      );
+      await connection.execute(
+        'UPDATE sessions SET revoked_at = COALESCE(revoked_at, ?) WHERE user_id = ?',
+        [timestamp, userId],
+      );
+      await connection.execute(
+        'UPDATE password_reset_tokens SET consumed_at = GREATEST(?, created_at) WHERE user_id = ? AND consumed_at IS NULL',
+        [timestamp, userId],
+      );
+      await connection.commit();
+      return true;
+    } catch (error) { await connection.rollback(); throw error; }
+    finally { connection.release(); }
   }
 }
 

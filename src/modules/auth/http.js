@@ -39,6 +39,10 @@ export function createAuthRouter({ auth, environment, requireIdentity }) {
     testRateLimit('AUTH_TEST_REGISTRATION_LIMIT', 5, environment));
   const loginLimit = authRateLimit(15 * 60 * 1000,
     testRateLimit('AUTH_TEST_LOGIN_LIMIT', 10, environment));
+  const resetRequestLimit = authRateLimit(60 * 60 * 1000,
+    testRateLimit('AUTH_TEST_RESET_REQUEST_LIMIT', 5, environment));
+  const resetConfirmLimit = authRateLimit(15 * 60 * 1000,
+    testRateLimit('AUTH_TEST_RESET_CONFIRM_LIMIT', 10, environment));
 
   router.post('/api/v1/auth/registrations', registrationLimit, async (request, response) => {
     const user = await auth.register(request.body);
@@ -53,6 +57,16 @@ export function createAuthRouter({ auth, environment, requireIdentity }) {
       sessionCookieOptions(environment, result.expiresAt),
     );
     response.json({ user: presentUser(result.user) });
+  });
+
+  router.post('/api/v1/auth/password-reset/request', resetRequestLimit, async (request, response) => {
+    await auth.requestPasswordReset(request.body);
+    response.json({ message: 'Si existe una cuenta asociada a ese correo, recibirás instrucciones para restablecer tu contraseña.' });
+  });
+
+  router.post('/api/v1/auth/password-reset/confirm', resetConfirmLimit, async (request, response) => {
+    await auth.confirmPasswordReset(request.body);
+    response.json({ message: 'Contraseña actualizada' });
   });
 
   router.delete('/api/v1/auth/session', async (request, response) => {

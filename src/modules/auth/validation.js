@@ -34,6 +34,11 @@ const loginSchema = z.object({
   email: emailSchema,
   password: loginPasswordSchema,
 }).strict();
+const resetRequestSchema = z.object({ email: emailSchema }).strict();
+const resetConfirmSchema = z.object({
+  token: z.string().max(128),
+  newPassword: passwordSchema,
+}).strict();
 
 export function validateRegistration(input) {
   return parse(registrationSchema, input);
@@ -45,6 +50,14 @@ export function validateLogin(input) {
 
 export function validatePassword(password) {
   return parse(passwordSchema, password);
+}
+
+export function validateResetRequest(input) {
+  return parse(resetRequestSchema, input);
+}
+
+export function validateResetConfirm(input) {
+  return parse(resetConfirmSchema, input);
 }
 
 function parse(schema, input) {

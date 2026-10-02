@@ -8,7 +8,7 @@ import {
   createBookingModule,
   createMySqlBookingAdapter,
 } from './modules/booking/index.js';
-import { createAuthModule, createMySqlAuthAdapter } from './modules/auth/index.js';
+import { createAuthModule, createMySqlAuthAdapter, createPasswordResetMailer } from './modules/auth/index.js';
 import { createMySqlUsersAdapter } from './modules/users/index.js';
 import { createFacilitiesModule, createMySqlFacilitiesAdapter } from './modules/facilities/index.js';
 import { createOwnerApplicationsModule, createMySqlOwnerApplicationsAdapter } from './modules/owner-applications/index.js';
@@ -20,12 +20,16 @@ import { createSystemClock } from './shared/clock.js';
 
 export async function startServer() {
   const config = loadAppConfig();
+  const sendPasswordResetEmail = createPasswordResetMailer({ environment: config.environment });
   const pool = createMySqlPool();
   const usersAdapter = createMySqlUsersAdapter({ pool });
   const catalogAdapter = createMySqlPublicCatalogAdapter({ pool });
   const bookingAdapter = createMySqlBookingAdapter({ pool, isPublicCourt: catalogAdapter.isPublicCourt });
   const clock = createSystemClock();
-  const auth = createAuthModule({ adapter: createMySqlAuthAdapter({ pool }), clock });
+  const auth = createAuthModule({
+    adapter: createMySqlAuthAdapter({ pool }), clock, frontendOrigin: config.frontendOrigin,
+    sendPasswordResetEmail,
+  });
   const booking = createBookingModule({
     adapter: bookingAdapter,
     clock,
