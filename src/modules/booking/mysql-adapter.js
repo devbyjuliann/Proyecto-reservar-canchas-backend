@@ -19,6 +19,7 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
     listOwnBookings,
     listOwnerBookings,
     cancelBooking,
+    listOperationalOwnerRecipients,
     replaceFacilityBookingPolicy,
     deactivateFacility,
     createCourt,
@@ -177,6 +178,22 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
       values,
     );
     return rows.map(mapBooking);
+  }
+
+  async function listOperationalOwnerRecipients({ facilityId }) {
+    const [rows] = await pool.execute(
+      `SELECT DISTINCT u.id, u.email
+       FROM facility_memberships AS m
+       INNER JOIN users AS u ON u.id = m.user_id
+       INNER JOIN user_roles AS r ON r.user_id = u.id AND r.role_code = 'PROPIETARIO'
+       WHERE m.facility_id = ?
+         AND m.membership_type = 'PROPIETARIO'
+         AND m.active = 1
+         AND u.deactivated_at IS NULL
+         AND u.owner_suspended_at IS NULL`,
+      [facilityId],
+    );
+    return rows.map((row) => ({ id: String(row.id), email: row.email }));
   }
 
   async function listOwnerBookings({ userId, facilityId, courtId, status,
@@ -1559,17 +1576,20 @@ async function loadBooking(connection, bookingId) {
 function bookingSelect() {
   return `SELECT b.id, b.user_id, b.start_at, b.end_at, b.booking_timezone,
                  b.status, b.created_at, b.cancelled_at, b.price_amount_minor, b.price_currency,
-                 c.id AS court_id, c.name AS court_name,
-                 f.id AS facility_id, f.name AS facility_name
-          FROM bookings AS b
-          INNER JOIN courts AS c ON c.id = b.court_id
-          INNER JOIN facilities AS f ON f.id = c.facility_id`;
+                  c.id AS court_id, c.name AS court_name,
+                  f.id AS facility_id, f.name AS facility_name,
+                  customer.name AS customer_name
+           FROM bookings AS b
+           INNER JOIN courts AS c ON c.id = b.court_id
+           INNER JOIN facilities AS f ON f.id = c.facility_id
+           INNER JOIN users AS customer ON customer.id = b.user_id`;
 }
 
 function mapBooking(row) {
   return {
     id: String(row.id),
     userId: String(row.user_id),
+    customerName: row.customer_name,
     court: { id: String(row.court_id), name: row.court_name },
     facility: { id: String(row.facility_id), name: row.facility_name },
     startAt: toInstantString(row.start_at),

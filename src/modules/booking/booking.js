@@ -124,7 +124,7 @@ export function createBookingModule({ adapter, clock, notifications, logger = co
       ? { details: { currentPriceMinor: result.currentPriceMinor ?? null, currency: 'COP' } }
       : undefined);
     const booking = presentBooking(result.booking, result.now);
-    if (!result.replayed) await notify('confirmation', actor, booking);
+    if (!result.replayed) await notifyBookingEvent('confirmation', actor, booking, result.booking.customerName);
     return { booking, replayed: result.replayed };
   }
 
@@ -204,17 +204,45 @@ export function createBookingModule({ adapter, clock, notifications, logger = co
     });
     if (!result) throw bookingError('resource_not_found');
     const booking = presentBooking(result.booking, result.now);
-    if (result.changed) await notify('cancellation', actor, booking);
+    if (result.changed) await notifyBookingEvent('cancellation', actor, booking, result.booking.customerName);
     return { booking };
   }
 
-  async function notify(kind, actor, booking) {
+  async function notifyBookingEvent(kind, actor, booking, customerName) {
+    await notifyCustomer(kind, actor, booking);
+    await notifyOwners(kind, booking, customerName ?? actor?.name);
+  }
+
+  async function notifyCustomer(kind, actor, booking) {
     if (!notifications?.[kind]) return;
     try {
       if (!actor?.email) throw new Error('Recipient unavailable');
       await notifications[kind]({ email: actor.email, booking });
     } catch {
       logger.error?.(`Booking ${kind} email delivery failed`);
+    }
+  }
+
+  async function notifyOwners(kind, booking, customerName) {
+    const notification = kind === 'confirmation' ? notifications?.ownerConfirmation : notifications?.ownerCancellation;
+    if (!notification || typeof adapter.listOperationalOwnerRecipients !== 'function') return;
+    let recipients;
+    try {
+      recipients = await adapter.listOperationalOwnerRecipients({ facilityId: booking.facility.id });
+    } catch {
+      logger.error?.('Owner booking recipient lookup failed');
+      return;
+    }
+    const emails = new Set();
+    for (const recipient of recipients) {
+      const email = recipient?.email?.trim().toLowerCase();
+      if (!email || emails.has(email)) continue;
+      emails.add(email);
+      try {
+        await notification({ email: recipient.email, customerName: customerName ?? 'Cliente', booking });
+      } catch {
+        logger.error?.('owner_booking_email_failed');
+      }
     }
   }
 

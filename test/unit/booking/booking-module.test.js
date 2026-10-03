@@ -174,6 +174,41 @@ describe('booking module orchestration', () => {
     assert.equal(confirmation.booking.id, '901');
   });
 
+  it('continues notification delivery after a client or owner email failure', async () => {
+    const sent = [];
+    const errors = [];
+    const adapter = {
+      async confirmBooking() {
+        return { kind: 'succeeded', booking: booking({ customerName: 'Cliente Reserva' }), now: NOW, replayed: false };
+      },
+      async listOperationalOwnerRecipients() {
+        return [{ email: 'owner-a@example.test' }, { email: 'owner-b@example.test' }];
+      },
+    };
+    const bookingModule = createBookingModule({
+      adapter,
+      clock: { now: () => NOW },
+      logger: { error: (message) => { errors.push(message); } },
+      notifications: {
+        confirmation: async () => { throw new Error('provider detail'); },
+        ownerConfirmation: async ({ email }) => {
+          if (email === 'owner-a@example.test') throw new Error('provider detail');
+          sent.push(email);
+        },
+      },
+    });
+    await bookingModule.confirmBooking({
+      actor: { id: '7', email: 'customer@example.test' },
+      request: {
+        courtId: '12', localDate: '2026-09-28', startTime: '16:00:00', durationMinutes: 60,
+        expectedPriceMinor: 9000000, currency: 'COP',
+      },
+      idempotencyKey: 'notification-failure',
+    });
+    assert.deepEqual(sent, ['owner-b@example.test']);
+    assert.deepEqual(errors, ['Booking confirmation email delivery failed', 'owner_booking_email_failed']);
+  });
+
   it('derives effective states and emits an opaque next cursor', async () => {
     let receivedCursor;
     const adapter = {

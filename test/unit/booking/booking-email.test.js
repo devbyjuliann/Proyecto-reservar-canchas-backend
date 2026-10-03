@@ -54,3 +54,35 @@ describe('client booking emails', () => {
     assert.equal(message.html.includes('<script>'), false);
   });
 });
+
+describe('owner booking emails', () => {
+  it('uses the booking snapshot, local time and owner bookings CTA for a new booking', async () => {
+    const sent = [];
+    const notifier = createBookingEmailNotifier({ sendEmail: async (message) => { sent.push(message); },
+      frontendOrigin: 'https://canchapp.online' });
+    await notifier.ownerConfirmation({ email: 'owner@example.test', customerName: 'Cliente Reserva', booking: BOOKING });
+    assert.equal(sent[0].type, 'owner-booking-confirmation');
+    assert.equal(sent[0].subject, 'Nueva reserva recibida - Reserva Canchas');
+    for (const detail of ['Recibiste una nueva reserva', 'Cliente Reserva', 'La Pista', 'Cancha Norte',
+      '10 de octubre de 2026', '18:00 - 19:00', '60 minutos', '$50.000 COP',
+      'Estado: Confirmada', 'https://canchapp.online/owner/bookings']) {
+      assert.ok(sent[0].text.includes(detail), detail);
+    }
+    assert.equal(sent[0].text.includes('23:00'), false);
+  });
+
+  it('keeps historical booking data for an owner cancellation without promising availability', async () => {
+    let message;
+    const notifier = createBookingEmailNotifier({ sendEmail: async (value) => { message = value; },
+      frontendOrigin: 'https://canchapp.online' });
+    await notifier.ownerCancellation({ email: 'owner@example.test', customerName: 'Cliente Reserva', booking: BOOKING });
+    assert.equal(message.type, 'owner-booking-cancellation');
+    assert.equal(message.subject, 'Reserva cancelada por el cliente - Reserva Canchas');
+    for (const detail of ['Un cliente canceló una reserva.', 'Cliente Reserva', '$50.000 COP',
+      'Estado: Cancelada', 'El horario vuelve a quedar sujeto a la disponibilidad actual de la cancha.']) {
+      assert.ok(message.text.includes(detail), detail);
+    }
+    assert.equal(message.text.toLowerCase().includes('reembolso'), false);
+    assert.equal(message.text.toLowerCase().includes('ya está disponible'), false);
+  });
+});

@@ -326,7 +326,7 @@ describe('booking MySQL integration', { skip: !MYSQL_AVAILABLE, timeout: 30_000 
     assert.match(rows[0].cancelled_at, /\.\d{6}$/);
   });
 
-  it('emails the client once per real transition, using the original price after a tariff change', async () => {
+  it('emails the client and each operational owner once per real transition, using the original price after a tariff change', async () => {
     await pool.execute('UPDATE court_prices SET price_amount_minor = 5000000 WHERE court_id = ?', [fixture.courtId]);
     const sent = [];
     const notifications = createBookingEmailNotifier({
@@ -337,26 +337,34 @@ describe('booking MySQL integration', { skip: !MYSQL_AVAILABLE, timeout: 30_000 
     const bookingRequest = { ...fixture.request, expectedPriceMinor: 5000000 };
     const first = await withEmail.confirmBooking({ actor, request: bookingRequest, idempotencyKey: 'email-replay' });
     assert.equal(first.replayed, false);
-    assert.equal(sent.length, 1);
-    assert.equal(sent[0].type, 'booking-confirmation');
-    assert.equal(sent[0].email, actor.email);
+    assert.equal(sent.length, 3);
+    assert.deepEqual(sent.filter(({ type }) => type === 'booking-confirmation').map(({ email }) => email), [actor.email]);
+    assert.deepEqual(sent.filter(({ type }) => type === 'owner-booking-confirmation').map(({ email }) => email).sort(),
+      fixture.operationalOwnerEmails.slice().sort());
     const localDate = new Intl.DateTimeFormat('es-CO', { day: 'numeric', month: 'long', year: 'numeric',
       timeZone: 'America/Bogota' }).format(new Date(first.booking.startAt));
-    assert.ok(sent[0].text.includes(localDate));
-    assert.ok(sent[0].text.includes('12:00 - 13:00'));
-    assert.ok(sent[0].text.includes('$50.000 COP'));
+    for (const message of sent) {
+      assert.ok(message.text.includes(localDate));
+      assert.ok(message.text.includes('12:00 - 13:00'));
+      assert.ok(message.text.includes('$50.000 COP'));
+    }
     const replay = await withEmail.confirmBooking({ actor, request: bookingRequest, idempotencyKey: 'email-replay' });
     assert.equal(replay.replayed, true);
-    assert.equal(sent.length, 1);
+    assert.equal(sent.length, 3);
 
     await pool.execute('UPDATE court_prices SET price_amount_minor = 6000000 WHERE court_id = ?', [fixture.courtId]);
     const cancelled = await withEmail.cancelBooking({ actor, bookingId: first.booking.id });
     assert.equal(cancelled.booking.status, 'CANCELADA');
     await withEmail.cancelBooking({ actor, bookingId: first.booking.id });
-    assert.equal(sent.length, 2);
-    assert.equal(sent[1].type, 'booking-cancellation');
-    assert.ok(sent[1].text.includes('$50.000 COP'));
-    assert.equal(sent[1].text.includes('$60.000 COP'), false);
+    assert.equal(sent.length, 6);
+    assert.deepEqual(sent.filter(({ type }) => type === 'booking-cancellation').map(({ email }) => email), [actor.email]);
+    const ownerCancellations = sent.filter(({ type }) => type === 'owner-booking-cancellation');
+    assert.deepEqual(ownerCancellations.map(({ email }) => email).sort(), fixture.operationalOwnerEmails.slice().sort());
+    for (const message of ownerCancellations) {
+      assert.ok(message.text.includes('$50.000 COP'));
+      assert.equal(message.text.includes('$60.000 COP'), false);
+      assert.ok(message.text.includes('El horario vuelve a quedar sujeto a la disponibilidad actual de la cancha.'));
+    }
     const [rows] = await pool.execute('SELECT status, price_amount_minor FROM bookings WHERE id = ?', [first.booking.id]);
     assert.equal(rows[0].status, 'CANCELADA');
     assert.equal(Number(rows[0].price_amount_minor), 5000000);
@@ -386,7 +394,10 @@ describe('booking MySQL integration', { skip: !MYSQL_AVAILABLE, timeout: 30_000 
     const [after] = await pool.execute('SELECT status FROM bookings WHERE id = ?', [bookingId]);
     assert.equal(after[0].status, 'CANCELADA');
     assert.deepEqual(errors, [
-      'Booking confirmation email delivery failed', 'Booking cancellation email delivery failed',
+      'Booking confirmation email delivery failed',
+      'owner_booking_email_failed', 'owner_booking_email_failed',
+      'Booking cancellation email delivery failed',
+      'owner_booking_email_failed', 'owner_booking_email_failed',
     ]);
     assert.equal(errors.join(' ').includes('Sensitive provider failure'), false);
   });
@@ -407,6 +418,18 @@ async function seedFixture(pool) {
       userIds.push(String(user.insertId));
       userEmails.push(email);
     }
+    const ownerIds = [];
+    const ownerEmails = [];
+    for (const suffix of ['active-one', 'active-two', 'suspended', 'deactivated', 'inactive-membership']) {
+      const email = `${randomUUID()}@example.com`;
+      const [owner] = await connection.execute(
+        'INSERT INTO users (name, email) VALUES (?, ?)',
+        [`Owner ${suffix}`, email],
+      );
+      ownerIds.push(String(owner.insertId));
+      ownerEmails.push(email);
+      await connection.execute("INSERT INTO user_roles (user_id, role_code) VALUES (?, 'PROPIETARIO')", [owner.insertId]);
+    }
     const [facility] = await connection.execute(
       `INSERT INTO facilities
          (name, timezone, minimum_advance_minutes, maximum_advance_minutes)
@@ -414,6 +437,16 @@ async function seedFixture(pool) {
       [`Integration ${randomUUID()}`],
     );
     const facilityId = String(facility.insertId);
+    for (const [index, ownerId] of ownerIds.entries()) {
+      await connection.execute(
+        `INSERT INTO facility_memberships
+         (facility_id, user_id, membership_type, active, created_at, deactivated_at, created_by_user_id)
+         VALUES (?, ?, 'PROPIETARIO', ?, NOW(6), ${index < 4 ? 'NULL' : 'NOW(6)'}, ?)`,
+        [facilityId, ownerId, index < 4 ? 1 : 0, ownerIds[0]],
+      );
+    }
+    await connection.execute('UPDATE users SET owner_suspended_at = NOW(6) WHERE id = ?', [ownerIds[2]]);
+    await connection.execute('UPDATE users SET deactivated_at = NOW(6) WHERE id = ?', [ownerIds[3]]);
     const [court] = await connection.execute(
       `INSERT INTO courts
          (facility_id, name, minimum_separation_minutes, start_interval_minutes)
@@ -443,6 +476,9 @@ async function seedFixture(pool) {
     return {
       userIds,
       userEmails,
+      ownerIds,
+      ownerEmails,
+      operationalOwnerEmails: ownerEmails.slice(0, 2),
       facilityId,
       courtId,
       request: {
@@ -482,12 +518,21 @@ async function cleanFixture(pool, fixture) {
       [fixture.courtId],
     );
     await connection.execute('DELETE FROM courts WHERE id = ?', [fixture.courtId]);
+    await connection.execute('DELETE FROM facility_memberships WHERE facility_id = ?', [fixture.facilityId]);
     await connection.execute('DELETE FROM facilities WHERE id = ?', [fixture.facilityId]);
     await connection.execute(
       'DELETE FROM user_roles WHERE user_id IN (?, ?)',
       fixture.userIds,
     );
+    await connection.execute(
+      `DELETE FROM user_roles WHERE user_id IN (${fixture.ownerIds.map(() => '?').join(', ')})`,
+      fixture.ownerIds,
+    );
     await connection.execute('DELETE FROM users WHERE id IN (?, ?)', fixture.userIds);
+    await connection.execute(
+      `DELETE FROM users WHERE id IN (${fixture.ownerIds.map(() => '?').join(', ')})`,
+      fixture.ownerIds,
+    );
     await connection.commit();
   } catch (error) {
     await connection.rollback();
