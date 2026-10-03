@@ -13,7 +13,7 @@ const instant = z.string().regex(/^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[
 const query = z.object({
   facilityId: id.optional(),
   courtId: id.optional(),
-  status: z.enum(['CONFIRMADA', 'CANCELADA', 'COMPLETADA']).optional(),
+  status: z.enum(['PENDIENTE_PAGO', 'CONFIRMADA', 'CANCELADA', 'COMPLETADA']).optional(),
   startFrom: instant.optional(),
   startBefore: instant.optional(),
   limit: z.string().regex(/^[1-9]\d*$/).optional(),

@@ -25,10 +25,25 @@ export function createBookingModule({ adapter, clock, notifications, logger = co
 
   return Object.freeze({
     getAvailability,
+    getFacilityCredit,
     confirmBooking,
+    approveTestPayment,
+    createPaymentAttempt,
+    settlePayment,
+    getLatestWompiTransaction,
     listOwnBookings,
     listOwnerBookings,
     cancelBooking,
+    cancelExceptionBooking,
+    rescheduleBooking,
+    listBookingChanges,
+    requestBookingException,
+    listOwnerExceptions,
+    decideBookingException,
+    cancelOwnerBooking,
+    markNoShow,
+    updateCancellationPolicy,
+    updateDepositPolicy,
     replaceFacilityBookingPolicy,
     deactivateFacility,
     createCourt,
@@ -60,6 +75,8 @@ export function createBookingModule({ adapter, clock, notifications, logger = co
       court: {
         id: String(snapshot.court.id),
         timeZone: snapshot.context.timeZone,
+        cancellationMinMinutes: snapshot.court.cancellationMinMinutes,
+        depositPercentage: snapshot.court.depositPercentage,
       },
       date,
       generatedAt: now,
@@ -74,6 +91,12 @@ export function createBookingModule({ adapter, clock, notifications, logger = co
     };
   }
 
+  async function getFacilityCredit({ actor, facilityId }) {
+    const credit = await adapter.getFacilityCredit({ facilityId, userId: String(actor.id) });
+    if (!credit) throw bookingError('resource_not_found');
+    return { facilityId: String(facilityId), balanceMinor: credit.balanceMinor, currency: 'COP' };
+  }
+
   async function confirmBooking({ actor, request, idempotencyKey }) {
     const requestHash = createHash('sha256')
       .update(JSON.stringify({
@@ -83,6 +106,7 @@ export function createBookingModule({ adapter, clock, notifications, logger = co
         durationMinutes: request.durationMinutes,
         expectedPriceMinor: request.expectedPriceMinor,
         currency: request.currency,
+        useCreditMinor: request.useCreditMinor ?? 0,
       }))
       .digest();
 
@@ -124,8 +148,11 @@ export function createBookingModule({ adapter, clock, notifications, logger = co
       ? { details: { currentPriceMinor: result.currentPriceMinor ?? null, currency: 'COP' } }
       : undefined);
     const booking = presentBooking(result.booking, result.now);
-    if (!result.replayed) await notifyBookingEvent('confirmation', actor, booking, result.booking.customerName);
-    return { booking, replayed: result.replayed };
+    // Confirmation is emitted only after a deposit is approved, never for a held checkout slot.
+    if (!result.replayed && booking.status === BOOKING_STATUS.CONFIRMED) {
+      await notifyBookingEvent('confirmation', actor, booking, result.booking.customerName);
+    }
+    return { booking, checkout: result.checkout, replayed: result.replayed };
   }
 
   async function listOwnBookings({ actor, limit, cursor }) {
@@ -148,6 +175,37 @@ export function createBookingModule({ adapter, clock, notifications, logger = co
           : null,
       },
     };
+  }
+
+  async function approveTestPayment({ bookingId, providerReference, amountMinor }) {
+    const result = await adapter.approveTestPayment({ bookingId, providerReference, amountMinor });
+    if (!result.replayed) {
+      const booking = presentBooking(result.booking, toInstantString(clock.now()));
+      await notifyBookingEvent('confirmation', {
+        id: result.booking.userId,
+        email: result.booking.customerEmail,
+      }, booking, result.booking.customerName);
+      return { ...result, booking };
+    }
+    return { ...result, booking: presentBooking(result.booking, toInstantString(clock.now())) };
+  }
+
+  async function createPaymentAttempt({ actor, bookingId, provider, reference }) {
+    return adapter.createPaymentAttempt({ bookingId, userId: String(actor.id), provider, reference });
+  }
+
+  async function getLatestWompiTransaction({ actor, bookingId }) {
+    return adapter.getLatestWompiTransaction({ bookingId, userId: String(actor.id) });
+  }
+
+  async function settlePayment(input) {
+    const result = await adapter.settlePayment(input);
+    if (result.confirmed && result.booking) {
+      const presented = presentBooking(result.booking, toInstantString(clock.now()));
+      await notifyBookingEvent('confirmation', { id: result.booking.userId, email: result.booking.customerEmail },
+        presented, result.booking.customerName);
+    }
+    return result;
   }
 
   async function listOwnerBookings({ actor, limit, cursor, ...input }) {
@@ -173,8 +231,15 @@ export function createBookingModule({ adapter, clock, notifications, logger = co
       court: row.court,
       facility: row.facility,
       user: row.user,
-      priceMinor: row.priceMinor,
-      currency: row.currency,
+       priceMinor: row.priceMinor,
+       currency: row.currency,
+       noShowAt: row.noShowAt,
+       paymentStatus: row.paymentStatus,
+       depositPercentage: row.depositPercentage,
+       depositAmountMinor: row.depositAmountMinor,
+       amountPaidMinor: row.amountPaidMinor,
+       paymentExpiresAt: row.paymentExpiresAt,
+       voluntaryRescheduleCount: row.voluntaryRescheduleCount,
     }));
     const last = rows[limit - 1];
     return { items, page: { nextCursor: rows.length > limit
@@ -182,7 +247,12 @@ export function createBookingModule({ adapter, clock, notifications, logger = co
       : null } };
   }
 
-  async function cancelBooking({ actor, bookingId }) {
+  async function cancelBooking({ actor, bookingId, expectedStartAt }) {
+    if (expectedStartAt !== undefined) {
+      try {
+        if (toInstantString(expectedStartAt) !== expectedStartAt) throw new Error();
+      } catch { throw bookingError('invalid_request'); }
+    }
     const result = await adapter.cancelBooking({
       userId: String(actor.id),
       bookingId,
@@ -190,6 +260,7 @@ export function createBookingModule({ adapter, clock, notifications, logger = co
         if (String(booking.userId) !== String(actor.id)) {
           throw bookingError('forbidden');
         }
+        if (expectedStartAt && booking.startAt !== expectedStartAt) throw bookingError('booking_conflict');
         if (booking.status === BOOKING_STATUS.CANCELLED) return 'unchanged';
 
         const effectiveStatus = effectiveBookingStatus(booking, now);
@@ -197,7 +268,11 @@ export function createBookingModule({ adapter, clock, notifications, logger = co
           throw bookingError('invalid_booking_state');
         }
         if (compareInstants(now, booking.startAt) >= 0) {
-          throw bookingError('booking_already_started');
+          throw bookingError('booking_cancellation_window_closed');
+        }
+        if (compareInstants(now, Temporal.Instant.from(booking.startAt)
+          .subtract({ minutes: booking.cancellationMinMinutes ?? 120 }).toString()) > 0) {
+          throw bookingError('booking_cancellation_window_closed');
         }
         return 'cancel';
       },
@@ -208,23 +283,125 @@ export function createBookingModule({ adapter, clock, notifications, logger = co
     return { booking };
   }
 
-  async function notifyBookingEvent(kind, actor, booking, customerName) {
-    await notifyCustomer(kind, actor, booking);
-    await notifyOwners(kind, booking, customerName ?? actor?.name);
+  async function rescheduleBooking({ actor, bookingId, request, idempotencyKey }) {
+    const requestHash = createHash('sha256').update(JSON.stringify({ bookingId, ...request })).digest();
+    const result = await adapter.rescheduleBooking({ bookingId, userId: String(actor.id), request,
+      idempotencyKey, requestHash,
+      decide({ booking, now, exceptionApproved }) {
+        if (booking.status !== BOOKING_STATUS.CONFIRMED || booking.noShowAt
+          || compareInstants(now, booking.endAt) >= 0) {
+          throw bookingError('invalid_booking_state');
+        }
+        const cutoff = Temporal.Instant.from(booking.startAt)
+          .subtract({ minutes: booking.cancellationMinMinutes ?? 120 }).toString();
+        if (compareInstants(now, cutoff) > 0 && !exceptionApproved) {
+          throw bookingError('booking_cancellation_window_closed');
+        }
+        if (!exceptionApproved && (booking.voluntaryRescheduleCount ?? 0) >= 1) {
+          throw bookingError('voluntary_reschedule_limit_reached');
+        }
+        return compareInstants(now, cutoff) > 0;
+      },
+      evaluate({ context, now, durationMinutes }) {
+        let decision;
+        try {
+          decision = createBookingDomain({ clock: { now: () => now } }).validateOption(context,
+            { startTime: request.startTime, durationMinutes });
+        } catch (error) {
+          if (error?.code === 'INVALID_LOCAL_TIME_IN_TIME_ZONE') {
+            return { accepted: false, code: 'invalid_booking_option' };
+          }
+          throw error;
+        }
+        if (!decision.reservable) return { accepted: false,
+          code: decision.reasons.map((reason) => REJECTION_CODES[reason]).find(Boolean) ?? 'internal_error' };
+        return { accepted: true, option: decision.option };
+      },
+    });
+    const booking = presentBooking(result.booking, result.now);
+    if (!result.replayed) await notifyBookingEvent('reschedule', actor, booking,
+      result.booking.customerName, { previous: result.previous });
+    return { booking, replayed: result.replayed };
   }
 
-  async function notifyCustomer(kind, actor, booking) {
+  async function cancelExceptionBooking({ actor, bookingId }) {
+    const result = await adapter.cancelExceptionBooking({ userId: String(actor.id), bookingId });
+    const booking = presentBooking(result.booking, result.now);
+    await notifyBookingEvent('cancellation', actor, booking, result.booking.customerName);
+    return { booking };
+  }
+
+  async function listBookingChanges({ actor, bookingId }) {
+    const items = await adapter.listBookingChanges({ userId: String(actor.id), bookingId });
+    if (!items) throw bookingError('resource_not_found');
+    return { items };
+  }
+
+  async function requestBookingException({ actor, bookingId, category, note }) {
+    return { exception: await adapter.requestBookingException({ bookingId, userId: String(actor.id), category, note }) };
+  }
+
+  async function listOwnerExceptions({ actor }) {
+    assertOperationalActor(actor);
+    if (!actor.ownerScope) throw bookingError('forbidden');
+    return { items: await adapter.listOwnerExceptions({ ownerUserId: String(actor.id) }) };
+  }
+
+  async function decideBookingException({ actor, exceptionId, decision }) {
+    assertOperationalActor(actor);
+    if (!actor.ownerScope) throw bookingError('forbidden');
+    const result = await adapter.decideBookingException({ exceptionId, ownerUserId: String(actor.id), decision });
+    await notifyCustomer('exceptionDecision', { email: result.booking.customerEmail },
+      presentBooking(result.booking, toInstantString(clock.now())), { decision, category: result.exception.category });
+    return { exception: result.exception };
+  }
+
+  async function cancelOwnerBooking({ actor, bookingId, reason, reasonCode }) {
+    assertOperationalActor(actor);
+    if (!actor.ownerScope) throw bookingError('forbidden');
+    const result = await adapter.cancelOwnerBooking({ bookingId, ownerUserId: String(actor.id), reason, reasonCode });
+    const booking = presentBooking(result.booking, toInstantString(clock.now()));
+    await notifyCustomer('customerOwnerCancellation', { email: result.booking.customerEmail }, booking, { reason });
+    return { booking };
+  }
+
+  async function markNoShow({ actor, bookingId }) {
+    assertOperationalActor(actor);
+    if (!actor.ownerScope) throw bookingError('forbidden');
+    const result = await adapter.markNoShow({ bookingId, ownerUserId: String(actor.id) });
+    return { booking: presentBooking(result.booking, toInstantString(clock.now())) };
+  }
+
+  async function updateCancellationPolicy({ actor, courtId, cancellationMinMinutes }) {
+    assertOperationalActor(actor);
+    if (!actor.ownerScope) throw bookingError('forbidden');
+    return adapter.updateCancellationPolicy({ courtId, ownerUserId: String(actor.id), minutes: cancellationMinMinutes });
+  }
+
+  async function updateDepositPolicy({ actor, courtId, depositPercentage }) {
+    assertOperationalActor(actor);
+    if (!actor.ownerScope) throw bookingError('forbidden');
+    return adapter.updateDepositPolicy({ courtId, ownerUserId: String(actor.id), percentage: depositPercentage });
+  }
+
+  async function notifyBookingEvent(kind, actor, booking, customerName, details = {}) {
+    await notifyCustomer(kind, actor, booking, details);
+    await notifyOwners(kind, booking, customerName ?? actor?.name, details);
+  }
+
+  async function notifyCustomer(kind, actor, booking, details = {}) {
     if (!notifications?.[kind]) return;
     try {
       if (!actor?.email) throw new Error('Recipient unavailable');
-      await notifications[kind]({ email: actor.email, booking });
+      await notifications[kind]({ email: actor.email, booking, ...details });
     } catch {
       logger.error?.(`Booking ${kind} email delivery failed`);
     }
   }
 
-  async function notifyOwners(kind, booking, customerName) {
-    const notification = kind === 'confirmation' ? notifications?.ownerConfirmation : notifications?.ownerCancellation;
+  async function notifyOwners(kind, booking, customerName, details = {}) {
+    const notification = kind === 'confirmation' ? notifications?.ownerConfirmation
+      : kind === 'reschedule' ? notifications?.ownerReschedule : notifications?.ownerCancellation;
     if (!notification || typeof adapter.listOperationalOwnerRecipients !== 'function') return;
     let recipients;
     try {
@@ -239,7 +416,7 @@ export function createBookingModule({ adapter, clock, notifications, logger = co
       if (!email || emails.has(email)) continue;
       emails.add(email);
       try {
-        await notification({ email: recipient.email, customerName: customerName ?? 'Cliente', booking });
+        await notification({ email: recipient.email, customerName: customerName ?? 'Cliente', booking, ...details });
       } catch {
         logger.error?.('owner_booking_email_failed');
       }
@@ -557,6 +734,17 @@ function presentBooking(booking, now) {
     timeZone: booking.timeZone,
     priceMinor: booking.priceMinor ?? null,
     currency: booking.currency ?? null,
+    cancellationMinMinutes: booking.cancellationMinMinutes ?? 120,
+    cancellationReason: booking.cancellationReason ?? null,
+    economicOutcome: booking.economicOutcome ?? null,
+    noShowAt: booking.noShowAt ?? null,
+    paymentStatus: booking.paymentStatus ?? null,
+    depositPercentage: booking.depositPercentage ?? null,
+    depositAmountMinor: booking.depositAmountMinor ?? null,
+    amountPaidMinor: booking.amountPaidMinor ?? null,
+    paymentExpiresAt: booking.paymentExpiresAt ?? null,
+    voluntaryRescheduleCount: booking.voluntaryRescheduleCount ?? null,
+    exceptionApproved: booking.exceptionApproved ?? false,
     status: effectiveBookingStatus({
       status: booking.status,
       endAt: booking.endAt,

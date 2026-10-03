@@ -1,6 +1,7 @@
 import { Temporal } from '@js-temporal/polyfill';
 
 export const BOOKING_STATUS = Object.freeze({
+  PENDING_PAYMENT: 'PENDIENTE_PAGO',
   CONFIRMED: 'CONFIRMADA',
   CANCELLED: 'CANCELADA',
   COMPLETED: 'COMPLETADA',
@@ -172,6 +173,7 @@ function bookingCrossesLocalMidnight(booking, timeZone) {
 }
 
 export function effectiveBookingStatus(booking, now) {
+  if (booking?.status === BOOKING_STATUS.PENDING_PAYMENT) return BOOKING_STATUS.PENDING_PAYMENT;
   if (booking?.status === BOOKING_STATUS.CANCELLED) return BOOKING_STATUS.CANCELLED;
   if (booking?.status === BOOKING_STATUS.COMPLETED) return BOOKING_STATUS.COMPLETED;
   if (booking?.status !== BOOKING_STATUS.CONFIRMED) {
@@ -241,8 +243,10 @@ function normalizeContext(input, now) {
     minimumAdvanceMinutes,
     maximumAdvanceMinutes,
     periods,
+    // The adapter has already removed expired holds with database time. A live checkout
+    // hold occupies the court exactly like a confirmed booking.
     bookings: bookings.filter((booking) =>
-      effectiveBookingStatus(booking, now) === BOOKING_STATUS.CONFIRMED),
+      [BOOKING_STATUS.CONFIRMED, BOOKING_STATUS.PENDING_PAYMENT].includes(booking.status)),
     unavailabilities: normalizeInstantIntervals(input.unavailabilities ?? [], 'unavailabilities'),
     now,
   };

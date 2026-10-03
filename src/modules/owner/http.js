@@ -1,6 +1,7 @@
 import { Router } from 'express';
 
 import { appError } from '../../shared/errors.js';
+import { validateCancellationRequest, validateOwnerCancellation } from '../booking/validation.js';
 import { validateOwnerBookingsQuery } from './validation.js';
 import {
   validateBookingConfiguration, validateCourtPatch, validateCreateCourt,
@@ -40,6 +41,58 @@ export function createOwnerOperationsRouter({ facilities, booking, memberships, 
       }
     }
     response.json(await booking.listOwnerBookings({ actor: actor(request), ...input }));
+  });
+
+  router.get(`${PREFIX}/booking-exceptions`, async (request, response) => {
+    validateEmptyQuery(request.query);
+    response.json(await booking.listOwnerExceptions({ actor: actor(request) }));
+  });
+
+  for (const [action, decision] of [['approve', 'APROBADA'], ['reject', 'RECHAZADA']]) {
+    router.post(`${PREFIX}/booking-exceptions/:exceptionId/${action}`, async (request, response) => {
+      validateEmptyQuery(request.query);
+      rejectBody(request);
+      const { exceptionId } = validateIdRequest('exceptionId', request.params.exceptionId);
+      response.json(await booking.decideBookingException({ actor: actor(request), exceptionId, decision }));
+    });
+  }
+
+  router.post(`${PREFIX}/bookings/:bookingId/cancellation`, async (request, response) => {
+    validateEmptyQuery(request.query);
+    const { bookingId } = validateCancellationRequest({ bookingId: request.params.bookingId });
+    response.json(await booking.cancelOwnerBooking({ actor: actor(request), bookingId,
+      ...validateOwnerCancellation(request.body) }));
+  });
+
+  router.post(`${PREFIX}/bookings/:bookingId/no-show`, async (request, response) => {
+    validateEmptyQuery(request.query);
+    rejectBody(request);
+    const { bookingId } = validateCancellationRequest({ bookingId: request.params.bookingId });
+    response.json(await booking.markNoShow({ actor: actor(request), bookingId }));
+  });
+
+  router.put(`${PREFIX}/courts/:courtId/cancellation-policy`, async (request, response) => {
+    validateEmptyQuery(request.query);
+    const id = courtId(request);
+    await ownCourt(request, id);
+    if (!request.body || Object.keys(request.body).join(',') !== 'cancellationMinMinutes'
+      || !Number.isSafeInteger(request.body.cancellationMinMinutes)
+      || request.body.cancellationMinMinutes < 0 || request.body.cancellationMinMinutes > 4_294_967_295) {
+      throw invalidRequest();
+    }
+    response.json(await booking.updateCancellationPolicy({ actor: actor(request), courtId: id,
+      cancellationMinMinutes: request.body.cancellationMinMinutes }));
+  });
+
+  router.put(`${PREFIX}/courts/:courtId/deposit-policy`, async (request, response) => {
+    validateEmptyQuery(request.query);
+    const id = courtId(request);
+    await ownCourt(request, id);
+    if (!request.body || Object.keys(request.body).join(',') !== 'depositPercentage'
+      || !Number.isSafeInteger(request.body.depositPercentage)
+      || request.body.depositPercentage < 1 || request.body.depositPercentage > 100) throw invalidRequest();
+    response.json(await booking.updateDepositPolicy({ actor: actor(request), courtId: id,
+      depositPercentage: request.body.depositPercentage }));
   });
 
   router.post(`${PREFIX}/facilities`, async (request, response) => {

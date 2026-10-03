@@ -35,6 +35,9 @@ test('confirmation accepts only the documented exact payload', () => {
   }
   assert.throws(() => validateConfirmationRequest({ ...input, currency: 'USD' }),
     { code: 'invalid_request' });
+  assert.equal(validateConfirmationRequest({ ...input, useCreditMinor: 2500 }).useCreditMinor, 2500);
+  assert.throws(() => validateConfirmationRequest({ ...input, useCreditMinor: -1 }),
+    { code: 'invalid_request' });
 });
 
 test('public ids accept only canonical positive BIGINT UNSIGNED strings', () => {

@@ -14,7 +14,7 @@ const COURT_READY = `${COURT_BASE} AND EXISTS
   (SELECT 1 FROM court_prices p WHERE p.court_id = c.id AND p.currency = 'COP')`;
 const FACILITY_COLUMNS = `f.id, f.name, f.city, f.address, f.description,
   f.timezone, f.published_at`;
-const COURT_COLUMNS = `c.id, c.name, c.description, c.sport_code,
+const COURT_COLUMNS = `c.id, c.name, c.description, c.sport_code, c.cancellation_min_minutes,
   f.id AS facility_id, f.name AS facility_name, f.city AS facility_city,
   f.timezone`;
 
@@ -256,7 +256,8 @@ function facilitySummary(row) {
 function courtSummary(row) {
   return { id: String(row.id), facility: { id: String(row.facility_id),
     name: row.facility_name, city: row.facility_city }, name: row.name,
-    description: row.description, sportCode: row.sport_code, image: null };
+    description: row.description, sportCode: row.sport_code,
+    cancellationMinMinutes: Number(row.cancellation_min_minutes), image: null };
 }
 
 async function rollbackValue(connection, value) {

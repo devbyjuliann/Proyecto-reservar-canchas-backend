@@ -54,6 +54,7 @@ describe('court pricing and booking snapshot MySQL', { skip: !available, timeout
       [fixture.courtId],
     );
     await pool.execute('DELETE FROM operational_changes WHERE court_id = ?', [fixture.courtId]);
+    await pool.execute('DELETE FROM booking_changes WHERE booking_id IN (SELECT id FROM bookings WHERE court_id = ?)', [fixture.courtId]);
     await pool.execute('DELETE FROM bookings WHERE court_id = ?', [fixture.courtId]);
     await pool.execute('DELETE FROM court_weekly_periods WHERE court_id = ?', [fixture.courtId]);
     await pool.execute('DELETE FROM court_prices WHERE court_id = ?', [fixture.courtId]);

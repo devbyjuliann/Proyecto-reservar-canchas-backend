@@ -27,6 +27,20 @@ function moduleWith(adapter, now = NOW) {
 }
 
 describe('booking module cancellation', () => {
+  it('applies the saved policy with an inclusive UTC cutoff, even if court policy changes', async () => {
+    const startAt = '2026-09-24T18:00:00.000000Z';
+    const adapter = { async cancelBooking({ decide }) {
+      const value = booking({ startAt, endAt: '2026-09-24T19:00:00.000000Z', cancellationMinMinutes: 120 });
+      const action = decide({ booking: value, now: this.now });
+      return { booking: { ...value, status: 'CANCELADA', cancelledAt: this.now }, now: this.now,
+        changed: action === 'cancel' };
+    }, now: '2026-09-24T16:00:00.000000Z' };
+    const module = moduleWith(adapter);
+    assert.equal((await module.cancelBooking({ actor: { id: '7' }, bookingId: '901' })).booking.status, 'CANCELADA');
+    adapter.now = '2026-09-24T16:00:01.000000Z';
+    await assert.rejects(module.cancelBooking({ actor: { id: '7' }, bookingId: '901' }),
+      { code: 'booking_cancellation_window_closed' });
+  });
   it('cancels an owned confirmed booking strictly before its start', async () => {
     let selectedAction;
     const adapter = {
@@ -83,7 +97,7 @@ describe('booking module cancellation', () => {
     };
     await assert.rejects(
       moduleWith(adapter).cancelBooking({ actor: { id: '7' }, bookingId: '901' }),
-      { code: 'booking_already_started' },
+      { code: 'booking_cancellation_window_closed' },
     );
 
     const completedAdapter = {
@@ -129,6 +143,17 @@ describe('booking module orchestration', () => {
     bookings: [],
     unavailabilities: [],
   };
+
+  it('presents only the caller facility credit in COP', async () => {
+    let received;
+    const adapter = { async getFacilityCredit(input) {
+      received = input;
+      return { balanceMinor: 2500 };
+    } };
+    const result = await moduleWith(adapter).getFacilityCredit({ actor: { id: '7' }, facilityId: '3' });
+    assert.deepEqual(received, { userId: '7', facilityId: '3' });
+    assert.deepEqual(result, { facilityId: '3', balanceMinor: 2500, currency: 'COP' });
+  });
 
   it('uses the domain evaluator for availability and confirmation', async () => {
     let confirmationDecision;

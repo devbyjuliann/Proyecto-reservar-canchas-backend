@@ -25,7 +25,7 @@ function createFixture({ environment = 'test', bookingOverrides = {} } = {}) {
   const booking = {
     async getAvailability({ courtId, date }) {
       return {
-        court: { id: courtId, timeZone: 'America/Bogota' },
+        court: { id: courtId, timeZone: 'America/Bogota', depositPercentage: 30 },
         date,
         generatedAt: '2026-09-24T14:30:00.000000Z',
         options: [{
@@ -53,6 +53,10 @@ function createFixture({ environment = 'test', bookingOverrides = {} } = {}) {
     async listOwnBookings() {
       return { items: [BOOKING], page: { nextCursor: null } };
     },
+    async getFacilityCredit({ facilityId }) {
+      if (facilityId !== '3') throw appError('resource_not_found', 'The requested resource was not found');
+      return { facilityId, balanceMinor: 2500, currency: 'COP' };
+    },
     async cancelBooking() {
       return {
         booking: {
@@ -73,6 +77,33 @@ function createFixture({ environment = 'test', bookingOverrides = {} } = {}) {
 }
 
 describe('booking HTTP contract', () => {
+  it('validates rescheduling and exceptions and forwards the stale-cancellation guard', async () => {
+    let reschedule;
+    let expectedStartAt;
+    const app = createFixture({ bookingOverrides: {
+      async rescheduleBooking(input) { reschedule = input; return { booking: BOOKING, replayed: false }; },
+      async requestBookingException(input) { return { exception: { id: '77', ...input } }; },
+      async cancelBooking(input) { expectedStartAt = input.expectedStartAt; return { booking: BOOKING }; },
+    } });
+    await request(app).post('/api/v1/bookings/901/reschedule').set('X-User-Id', '7')
+      .send({ localDate: '2026-09-28', startTime: '17:00:00', expectedPriceMinor: 9000000,
+        currency: 'COP' }).expect(400);
+    await request(app).post('/api/v1/bookings/901/reschedule').set('X-User-Id', '7')
+      .set('Idempotency-Key', 'reschedule-1').send({ localDate: '2026-09-28', startTime: '17:00:00',
+        expectedPriceMinor: 9000000, currency: 'COP' }).expect(200);
+    assert.equal(reschedule.bookingId, '901');
+    assert.equal(reschedule.request.startTime, '17:00:00');
+    await request(app).post('/api/v1/bookings/901/exception-requests').set('X-User-Id', '7')
+      .send({ category: 'MAL_CLIMA', note: 'Lluvia' }).expect(201);
+    await request(app).post('/api/v1/bookings/901/exception-requests').set('X-User-Id', '7')
+      .send({ category: 'MAL_CLIMA', userId: '8' }).expect(400);
+    await request(app).post('/api/v1/bookings/901/cancellation').set('X-User-Id', '7')
+      .set('X-Booking-Start-At', BOOKING.startAt).expect(200);
+    assert.equal(expectedStartAt, BOOKING.startAt);
+    const preflight = await request(app).options('/api/v1/bookings/901/cancellation')
+      .set('Origin', 'http://localhost:5173').expect(204);
+    assert.match(preflight.headers['access-control-allow-headers'], /X-Booking-Start-At/);
+  });
   it('serves health and public availability', async () => {
     const app = createFixture();
     await request(app).get('/health').expect(200, { status: 'ok' });
@@ -83,11 +114,20 @@ describe('booking HTTP contract', () => {
     assert.equal(response.body.court.id, '12');
     assert.equal(response.body.options[0].durationMinutes, 60);
     assert.equal(response.body.options[0].priceMinor, 9000000);
+    assert.equal(response.body.court.depositPercentage, 30);
 
     await request(app)
       .get('/api/v1/courts/12/availability?date=2026-09-28&courtId=13')
       .expect(400)
       .expect(({ body }) => assert.equal(body.error.code, 'invalid_request'));
+  });
+  it('returns only the authenticated customer facility credit', async () => {
+    const app = createFixture();
+    await request(app).get('/api/v1/me/facilities/3/credit').set('X-User-Id', '7')
+      .expect(200, { facilityId: '3', balanceMinor: 2500, currency: 'COP' });
+    await request(app).get('/api/v1/me/facilities/3/credit').expect(401);
+    await request(app).get('/api/v1/me/facilities/invalid/credit').set('X-User-Id', '7').expect(400);
+    await request(app).get('/api/v1/me/facilities/4/credit').set('X-User-Id', '7').expect(404);
   });
 
   it('maps malformed public ids to invalid_request', async () => {

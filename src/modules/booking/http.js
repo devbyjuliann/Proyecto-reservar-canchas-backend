@@ -5,8 +5,11 @@ import {
   validateAvailabilityRequest,
   validateCancellationRequest,
   validateConfirmationRequest,
+  validateFacilityCreditRequest,
   validateIdempotencyKey,
   validateOwnBookingsRequest,
+  validateRescheduleRequest,
+  validateExceptionRequest,
 } from './validation.js';
 
 export function createBookingRouter({ booking, requireIdentity, catalog }) {
@@ -38,8 +41,20 @@ export function createBookingRouter({ booking, requireIdentity, catalog }) {
       request: input,
       idempotencyKey,
     });
-    response.status(result.replayed ? 200 : 201).json({ booking: result.booking });
+    response.status(result.replayed ? 200 : 201).json({ booking: result.booking, checkout: result.checkout });
   });
+
+  if (process.env.NODE_ENV === 'test') {
+    router.post('/api/v1/test/bookings/:bookingId/payments/approve', async (request, response) => {
+      const { bookingId } = validateCancellationRequest({ bookingId: request.params.bookingId });
+      const body = request.body;
+      if (!body || Object.keys(body).sort().join(',') !== 'amountMinor,providerReference'
+        || typeof body.providerReference !== 'string' || !/^[\x21-\x7e]{1,128}$/.test(body.providerReference)
+        || !Number.isSafeInteger(body.amountMinor) || body.amountMinor < 1) throw bookingError('invalid_request');
+      response.json(await booking.approveTestPayment({ bookingId, providerReference: body.providerReference,
+        amountMinor: body.amountMinor }));
+    });
+  }
 
   router.get('/api/v1/me/bookings', requireIdentity, async (request, response) => {
     const input = validateOwnBookingsRequest(request.query);
@@ -47,6 +62,11 @@ export function createBookingRouter({ booking, requireIdentity, catalog }) {
       actor: request.context.user,
       ...input,
     }));
+  });
+
+  router.get('/api/v1/me/facilities/:facilityId/credit', requireIdentity, async (request, response) => {
+    const { facilityId } = validateFacilityCreditRequest({ facilityId: request.params.facilityId });
+    response.json(await booking.getFacilityCredit({ actor: request.context.user, facilityId }));
   });
 
   router.post(
@@ -58,9 +78,35 @@ export function createBookingRouter({ booking, requireIdentity, catalog }) {
       response.json(await booking.cancelBooking({
         actor: request.context.user,
         bookingId: input.bookingId,
+        expectedStartAt: request.get('X-Booking-Start-At'),
       }));
     },
   );
+
+  router.post('/api/v1/bookings/:bookingId/reschedule', requireIdentity, async (request, response) => {
+    const bookingId = validateCancellationRequest({ bookingId: request.params.bookingId }).bookingId;
+    const idempotencyKey = validateIdempotencyKey(singleHeader(request, 'idempotency-key'));
+    const result = await booking.rescheduleBooking({ actor: request.context.user, bookingId,
+      request: validateRescheduleRequest(request.body), idempotencyKey });
+    response.json({ booking: result.booking });
+  });
+
+  router.get('/api/v1/bookings/:bookingId/changes', requireIdentity, async (request, response) => {
+    const { bookingId } = validateCancellationRequest({ bookingId: request.params.bookingId });
+    response.json(await booking.listBookingChanges({ actor: request.context.user, bookingId }));
+  });
+
+  router.post('/api/v1/bookings/:bookingId/exception-requests', requireIdentity, async (request, response) => {
+    const { bookingId } = validateCancellationRequest({ bookingId: request.params.bookingId });
+    response.status(201).json(await booking.requestBookingException({ actor: request.context.user, bookingId,
+      ...validateExceptionRequest(request.body) }));
+  });
+
+  router.post('/api/v1/bookings/:bookingId/exception-cancellation', requireIdentity, async (request, response) => {
+    if (hasBody(request)) throw bookingError('invalid_request');
+    const { bookingId } = validateCancellationRequest({ bookingId: request.params.bookingId });
+    response.json(await booking.cancelExceptionBooking({ actor: request.context.user, bookingId }));
+  });
 
   return router;
 }

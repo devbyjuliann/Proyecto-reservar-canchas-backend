@@ -80,6 +80,9 @@ describe('owner operations MySQL integration', { skip: !available, timeout: 30_0
          OR operational_change_id IN (SELECT id FROM operational_changes WHERE court_id = ?)`,
         [courtId, courtId],
       );
+      await pool.execute('DELETE FROM booking_changes WHERE booking_id IN (SELECT id FROM bookings WHERE court_id = ?)', [courtId]);
+      await pool.execute('DELETE FROM payments WHERE booking_id IN (SELECT id FROM bookings WHERE court_id = ?)', [courtId]);
+      await pool.execute('DELETE FROM customer_credit_ledger WHERE booking_id IN (SELECT id FROM bookings WHERE court_id = ?)', [courtId]);
       await pool.execute('DELETE FROM bookings WHERE court_id = ?', [courtId]);
       await pool.execute('DELETE FROM court_unavailabilities WHERE court_id = ?', [courtId]);
       await pool.execute('DELETE FROM court_exception_periods WHERE exception_id IN (SELECT id FROM court_date_exceptions WHERE court_id = ?)', [courtId]);
@@ -135,6 +138,7 @@ describe('owner operations MySQL integration', { skip: !available, timeout: 30_0
     const config = await request(app).get(`${BASE}/courts/${courtId}/booking-configuration`)
       .set(cookies('ownerC')).expect(200);
     assert.deepEqual(config.body.allowedDurationsMinutes, [60, 90]);
+    assert.equal(config.body.depositPercentage, 30);
     await request(app).get(`${BASE}/courts/${courtId}/booking-configuration`)
       .set(cookies('ownerB')).expect(404);
     await request(app).put(`${BASE}/courts/${courtId}/prices/60`)
@@ -173,6 +177,8 @@ describe('owner operations MySQL integration', { skip: !available, timeout: 30_0
         durationMinutes: 60, expectedPriceMinor: 9000000, currency: 'COP' },
       idempotencyKey: 'owner-conflict-fixture',
     });
+    await booking.approveTestPayment({ bookingId: confirmed.booking.id,
+      providerReference: `owner-conflict-${courtId}`, amountMinor: confirmed.checkout.amountDueMinor });
     const changed = await request(app).put(`${BASE}/courts/${courtId}/weekly-schedule`)
       .set(cookies('ownerA')).send({ periods: [] }).expect(200);
     assert.equal(changed.body.operation.changes[0].conflictsCreated, 1);

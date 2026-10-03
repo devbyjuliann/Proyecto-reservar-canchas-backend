@@ -19,6 +19,7 @@ import { createCourtPricingModule, createMySqlCourtPricingAdapter } from './modu
 import { createOwnerDirectoryModule, createMySqlOwnerDirectoryAdapter } from './modules/owner-directory/index.js';
 import { createSystemClock } from './shared/clock.js';
 import { createEmailTransport } from './shared/email-transport.js';
+import { createWompiProvider } from './modules/payments/index.js';
 
 export async function startServer() {
   const config = loadAppConfig();
@@ -66,6 +67,11 @@ export async function startServer() {
     environment: config.environment,
     frontendOrigin: config.frontendOrigin,
     findActiveUserById: (userId) => usersAdapter.findById(userId),
+    wompi: config.wompi.enabled ? {
+      config: config.wompi,
+      provider: createWompiProvider({ config: config.wompi }),
+      redirectUrl: `${config.frontendOrigin}/reservas/pago`,
+    } : undefined,
   });
 
   const server = app.listen(config.port, config.host, () => {

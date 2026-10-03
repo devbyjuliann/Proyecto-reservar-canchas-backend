@@ -15,10 +15,25 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
 
   return Object.freeze({
     readAvailabilityContext,
+    getFacilityCredit,
     confirmBooking,
+    approveTestPayment,
+    createPaymentAttempt,
+    settlePayment,
+    getLatestWompiTransaction,
     listOwnBookings,
     listOwnerBookings,
     cancelBooking,
+    cancelExceptionBooking,
+    rescheduleBooking,
+    listBookingChanges,
+    requestBookingException,
+    decideBookingException,
+    listOwnerExceptions,
+    cancelOwnerBooking,
+    markNoShow,
+    updateCancellationPolicy,
+    updateDepositPolicy,
     listOperationalOwnerRecipients,
     replaceFacilityBookingPolicy,
     deactivateFacility,
@@ -50,6 +65,19 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
     }
   }
 
+  async function getFacilityCredit({ facilityId, userId }) {
+    const [rows] = await pool.execute(
+      `SELECT f.id, COALESCE(cb.balance_minor, 0) AS balance_minor
+       FROM facilities AS f
+       LEFT JOIN customer_credit_balances AS cb
+         ON cb.facility_id = f.id AND cb.user_id = ?
+       WHERE f.id = ?`,
+      [userId, facilityId],
+    );
+    if (!rows.length) return null;
+    return { balanceMinor: Number(rows[0].balance_minor) };
+  }
+
   async function confirmBooking({
     userId,
     request,
@@ -77,7 +105,8 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
           const now = await readDatabaseNow(connection);
           const booking = await loadBooking(connection, idempotency.row.booking_id);
           if (!booking) throw bookingError('internal_error');
-          return { kind: 'succeeded', booking, now, replayed: true };
+          return { kind: 'succeeded', booking, now, replayed: true,
+            checkout: checkoutFor(booking, Math.max(0, (booking.depositAmountMinor ?? 0) - (booking.amountPaidMinor ?? 0))) };
         }
         throw bookingError('internal_error');
       }
@@ -97,6 +126,8 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
         );
         return { kind: 'rejected', code: 'resource_not_found' };
       }
+
+      await expirePendingBookings(connection, request.courtId);
 
       if (isPublicCourt && !await isPublicCourt(connection, request.courtId, { requirePrice: false })) {
         const now = await readDatabaseNow(connection);
@@ -129,22 +160,43 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
         return { kind: 'rejected', code: 'booking_price_changed', currentPriceMinor };
       }
 
+      const depositPercentage = Number(snapshot.court.depositPercentage);
+      const depositAmountMinor = Math.ceil(currentPriceMinor * depositPercentage / 100);
+      const requestedCredit = request.useCreditMinor ?? 0;
+      const creditApplied = await spendCredit(connection, {
+        facilityId: snapshot.facility.id, userId, bookingId: null,
+        requestedMinor: Math.min(requestedCredit, depositAmountMinor), now,
+      });
+      const dueMinor = depositAmountMinor - creditApplied;
+      const paid = creditApplied;
       const [insert] = await connection.execute(
         `INSERT INTO bookings
            (user_id, court_id, start_at, end_at, booking_timezone, status, created_at,
-            price_amount_minor, price_currency)
-          VALUES (?, ?, ?, ?, ?, 'CONFIRMADA', ?, ?, 'COP')`,
+              price_amount_minor, price_currency, cancellation_min_minutes, economic_outcome,
+              deposit_percentage_snapshot, deposit_amount_minor, amount_paid_minor, payment_status,
+               payment_expires_at, voluntary_reschedule_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'COP', ?, 'NOT_APPLICABLE', ?, ?, ?, ?,
+              CASE WHEN ? = 0 THEN NULL ELSE DATE_ADD(UTC_TIMESTAMP(6), INTERVAL 10 MINUTE) END, 0)`,
         [
           userId,
           request.courtId,
           toMySqlDateTime(decision.option.startAt),
           toMySqlDateTime(decision.option.endAt),
           snapshot.context.timeZone,
+          dueMinor === 0 ? 'CONFIRMADA' : 'PENDIENTE_PAGO',
           toMySqlDateTime(now),
           currentPriceMinor,
+          snapshot.court.cancellationMinMinutes,
+          depositPercentage,
+          depositAmountMinor,
+          paid,
+          dueMinor === 0 ? 'PAGADO' : 'PENDIENTE',
+          dueMinor,
         ],
       );
       const bookingId = String(insert.insertId);
+      if (creditApplied > 0) await attachCreditSpend(connection, { facilityId: snapshot.facility.id,
+        userId, bookingId, amountMinor: creditApplied, now });
       const [completion] = await connection.execute(
         `UPDATE idempotency_records
          SET outcome = 'SUCCEEDED', booking_id = ?, result_code = NULL, completed_at = ?
@@ -155,7 +207,10 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
 
       const booking = await loadBooking(connection, bookingId);
       if (!booking) throw bookingError('internal_error');
-      return { kind: 'succeeded', booking, now, replayed: false };
+      await recordBookingChange(connection, { bookingId, actorUserId: userId, type: 'CREATED',
+        next: booking, outcome: 'NOT_APPLICABLE', now });
+      return { kind: 'succeeded', booking, now, replayed: false,
+        checkout: checkoutFor(booking, dueMinor) };
     });
   }
 
@@ -178,6 +233,111 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
       values,
     );
     return rows.map(mapBooking);
+  }
+
+  async function approveTestPayment({ bookingId, providerReference, amountMinor }) {
+    return runTransactionWithRetry(pool, async (connection) => {
+      const [initial] = await connection.execute('SELECT court_id FROM bookings WHERE id = ?', [bookingId]);
+      if (!initial.length) throw bookingError('resource_not_found');
+      await connection.execute('SELECT id FROM courts WHERE id = ? FOR UPDATE', [initial[0].court_id]);
+      await expirePendingBookings(connection, initial[0].court_id);
+      const [locked] = await connection.execute('SELECT * FROM bookings WHERE id = ? FOR UPDATE', [bookingId]);
+      if (!locked.length) throw bookingError('resource_not_found');
+      const booking = await loadBooking(connection, bookingId);
+      const now = await readDatabaseNow(connection);
+      const [existing] = await connection.execute(
+        "SELECT booking_id FROM payments WHERE provider = 'TEST' AND provider_reference = ? FOR UPDATE", [providerReference],
+      );
+      if (existing.length) {
+        if (String(existing[0].booking_id) !== String(bookingId)) throw bookingError('payment_reference_reused');
+        return { booking: await loadBooking(connection, bookingId), replayed: true };
+      }
+      if (booking.status !== 'PENDIENTE_PAGO' || booking.paymentExpiresAt == null) {
+        throw bookingError('invalid_booking_state');
+      }
+      const due = booking.depositAmountMinor - booking.amountPaidMinor;
+      if (amountMinor !== due) throw bookingError('invalid_payment_amount');
+      await connection.execute(
+        `INSERT INTO payments (booking_id, user_id, amount_minor, currency, status, purpose, provider,
+           provider_reference, created_at, updated_at)
+         VALUES (?, ?, ?, 'COP', 'APROBADO', 'DEPOSITO', 'TEST', ?, ?, ?)`,
+        [bookingId, booking.userId, amountMinor, providerReference, toMySqlDateTime(now), toMySqlDateTime(now)],
+      );
+      await connection.execute(
+        `UPDATE bookings SET status = 'CONFIRMADA', payment_status = 'PAGADO',
+           amount_paid_minor = amount_paid_minor + ?, payment_expires_at = NULL WHERE id = ?`,
+        [amountMinor, bookingId],
+      );
+      return { booking: await loadBooking(connection, bookingId), replayed: false };
+    });
+  }
+
+  async function createPaymentAttempt({ bookingId, userId, provider, reference }) {
+    return runTransactionWithRetry(pool, async (connection) => {
+      const [locked] = await connection.execute('SELECT * FROM bookings WHERE id = ? FOR UPDATE', [bookingId]);
+      if (!locked.length) throw bookingError('resource_not_found');
+      const booking = await loadBooking(connection, bookingId);
+      if (String(booking.userId) !== String(userId)) throw bookingError('forbidden');
+      const now = await readDatabaseNow(connection);
+      if (booking.status !== 'PENDIENTE_PAGO' || booking.paymentExpiresAt == null
+        || booking.paymentExpiresAt <= now) throw bookingError('invalid_booking_state');
+      const amountMinor = (booking.depositAmountMinor ?? 0) - (booking.amountPaidMinor ?? 0);
+      if (amountMinor < 1) throw bookingError('invalid_booking_state');
+      await connection.execute(`INSERT INTO payments (booking_id, user_id, amount_minor, currency, status, purpose,
+        provider, provider_reference, created_at, updated_at) VALUES (?, ?, ?, 'COP', 'PENDIENTE', 'DEPOSITO', ?, ?, ?, ?)`,
+      [bookingId, userId, amountMinor, provider, reference, toMySqlDateTime(now), toMySqlDateTime(now)]);
+      return { amountMinor, expiresAt: booking.paymentExpiresAt };
+    });
+  }
+
+  async function getLatestWompiTransaction({ bookingId, userId }) {
+    const [rows] = await pool.execute(`SELECT p.wompi_transaction_id FROM payments AS p
+      INNER JOIN bookings AS b ON b.id = p.booking_id WHERE p.booking_id = ? AND b.user_id = ?
+      AND p.provider = 'WOMPI' AND p.wompi_transaction_id IS NOT NULL ORDER BY p.id DESC LIMIT 1`, [bookingId, userId]);
+    return rows.length ? rows[0].wompi_transaction_id : null;
+  }
+
+  async function settlePayment({ provider, facts, eventId = null }) {
+    return runTransactionWithRetry(pool, async (connection) => {
+      if (eventId) {
+        const now = await readDatabaseNow(connection);
+        const [event] = await connection.execute(`INSERT IGNORE INTO payment_provider_events
+          (provider, provider_event_id, received_at) VALUES (?, ?, ?)`, [provider, eventId, toMySqlDateTime(now)]);
+        if (event.affectedRows === 0) return { changed: false, ignored: true };
+      }
+      const [payments] = await connection.execute(`SELECT * FROM payments WHERE provider = ? AND provider_reference = ? FOR UPDATE`,
+        [provider, facts.reference]);
+      if (!payments.length) return { changed: false, ignored: true };
+      const payment = payments[0];
+      const [bookings] = await connection.execute('SELECT * FROM bookings WHERE id = ? FOR UPDATE', [payment.booking_id]);
+      if (!bookings.length || Number(payment.amount_minor) !== facts.amountInCents || payment.currency !== facts.currency) {
+        return { changed: false, ignored: true };
+      }
+      if (payment.wompi_transaction_id && payment.wompi_transaction_id !== facts.id) return { changed: false, ignored: true };
+      const now = await readDatabaseNow(connection);
+      const finalStatus = facts.status === 'APPROVED' ? 'APROBADO'
+        : facts.status === 'DECLINED' || facts.status === 'VOIDED' ? 'RECHAZADO'
+          : facts.status === 'ERROR' ? 'FALLIDO' : 'PENDIENTE';
+      let finalizedAt = null;
+      try { finalizedAt = facts.finalizedAt ? toInstantString(facts.finalizedAt) : null; } catch { return { changed: false, ignored: true }; }
+      if (facts.status === 'APPROVED' && (!finalizedAt || !facts.id)) return { changed: false, ignored: true };
+      const expiredAt = bookings[0].payment_expires_at == null ? null : toInstantString(bookings[0].payment_expires_at);
+      const late = facts.status === 'APPROVED' && (!expiredAt || finalizedAt > expiredAt);
+      const status = late ? 'REFUND_PENDING' : finalStatus;
+      await connection.execute(`UPDATE payments SET status = ?, wompi_transaction_id = ?, provider_status = ?,
+        finalized_at = ?, payment_method_type = ?, updated_at = ? WHERE id = ?`,
+      [status, facts.id, facts.status, finalizedAt ? toMySqlDateTime(finalizedAt) : null, facts.paymentMethodType ?? null,
+        toMySqlDateTime(now), payment.id]);
+      if (late) {
+        await connection.execute("UPDATE bookings SET payment_status = 'REFUND_PENDING' WHERE id = ?", [payment.booking_id]);
+        return { changed: true, confirmed: false, refundPending: true };
+      }
+      if (facts.status !== 'APPROVED') return { changed: true, confirmed: false };
+      if (bookings[0].status !== 'PENDIENTE_PAGO') return { changed: false, ignored: true };
+      await connection.execute(`UPDATE bookings SET status = 'CONFIRMADA', payment_status = 'PAGADO',
+        amount_paid_minor = amount_paid_minor + ?, payment_expires_at = NULL WHERE id = ?`, [payment.amount_minor, payment.booking_id]);
+      return { changed: true, confirmed: true, booking: await loadBooking(connection, payment.booking_id) };
+    });
   }
 
   async function listOperationalOwnerRecipients({ facilityId }) {
@@ -208,6 +368,7 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
     if (startFrom) { clauses.push('b.start_at >= ?'); values.push(toMySqlDateTime(startFrom)); }
     if (startBefore) { clauses.push('b.start_at < ?'); values.push(toMySqlDateTime(startBefore)); }
     if (status === 'CANCELADA') clauses.push("b.status = 'CANCELADA'");
+    if (status === 'PENDIENTE_PAGO') clauses.push("b.status = 'PENDIENTE_PAGO' AND b.payment_expires_at > UTC_TIMESTAMP(6)");
     if (status === 'COMPLETADA') {
       clauses.push("b.status = 'CONFIRMADA' AND b.end_at <= ?");
       values.push(toMySqlDateTime(now));
@@ -222,8 +383,10 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
     }
     values.push(limit);
     const [rows] = await pool.execute(
-      `SELECT b.id, b.user_id, b.start_at, b.end_at, b.booking_timezone, b.status,
-              b.price_amount_minor, b.price_currency,
+       `SELECT b.id, b.user_id, b.start_at, b.end_at, b.booking_timezone, b.status,
+                b.price_amount_minor, b.price_currency, b.no_show_at, b.payment_status,
+                b.deposit_percentage_snapshot, b.deposit_amount_minor, b.amount_paid_minor,
+                b.payment_expires_at, b.voluntary_reschedule_count,
               c.id AS court_id, c.name AS court_name,
               f.id AS facility_id, f.name AS facility_name,
               customer.name AS customer_name
@@ -245,7 +408,14 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
       facility: { id: String(row.facility_id), name: row.facility_name },
       user: { id: String(row.user_id), name: row.customer_name },
       priceMinor: row.price_amount_minor == null ? null : Number(row.price_amount_minor),
-      currency: row.price_currency,
+       currency: row.price_currency,
+       noShowAt: row.no_show_at == null ? null : toInstantString(row.no_show_at),
+       paymentStatus: row.payment_status,
+       depositPercentage: row.deposit_percentage_snapshot == null ? null : Number(row.deposit_percentage_snapshot),
+       depositAmountMinor: row.deposit_amount_minor == null ? null : Number(row.deposit_amount_minor),
+       amountPaidMinor: row.amount_paid_minor == null ? null : Number(row.amount_paid_minor),
+       paymentExpiresAt: row.payment_expires_at == null ? null : toInstantString(row.payment_expires_at),
+       voluntaryRescheduleCount: row.voluntary_reschedule_count == null ? null : Number(row.voluntary_reschedule_count),
     }));
   }
 
@@ -263,7 +433,7 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
       );
       if (courtLocks.length !== 1) throw bookingError('internal_error');
       const [rows] = await connection.execute(
-        `SELECT id, user_id, court_id, start_at, end_at, status,
+         `SELECT id, user_id, court_id, start_at, end_at, status, cancellation_min_minutes,
                 cancelled_at, cancelled_by_user_id
          FROM bookings
          WHERE id = ?
@@ -276,18 +446,297 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
       const bookingState = mapBookingState(rows[0]);
       const action = decide({ booking: bookingState, now });
       if (action === 'cancel') {
+        const previous = await loadBooking(connection, bookingId);
+        const outcome = (previous.amountPaidMinor ?? 0) > 0 ? 'NON_REFUNDABLE' : 'REFUND_ALLOWED';
         const [update] = await connection.execute(
           `UPDATE bookings
-           SET status = 'CANCELADA', cancelled_at = ?, cancelled_by_user_id = ?
-           WHERE id = ? AND status = 'CONFIRMADA'`,
-          [toMySqlDateTime(now), userId, bookingId],
+             SET status = 'CANCELADA', cancelled_at = ?, cancelled_by_user_id = ?,
+                 cancellation_reason = 'CLIENTE_A_TIEMPO', economic_outcome = ?, payment_expires_at = NULL
+            WHERE id = ? AND status IN ('CONFIRMADA', 'PENDIENTE_PAGO')`,
+          [toMySqlDateTime(now), userId, outcome, bookingId],
         );
         if (update.affectedRows !== 1) throw bookingError('internal_error');
+        await recordBookingChange(connection, { bookingId, actorUserId: userId,
+          type: 'CANCELLED_BY_CUSTOMER', previous,
+          outcome, now });
       }
 
       const booking = await loadBooking(connection, bookingId);
       if (!booking) throw bookingError('internal_error');
       return { booking, now, changed: action === 'cancel' };
+    });
+  }
+
+  async function cancelExceptionBooking({ userId, bookingId }) {
+    return runTransactionWithRetry(pool, async (connection) => {
+      const [initial] = await connection.execute('SELECT court_id FROM bookings WHERE id = ?', [bookingId]);
+      if (!initial.length) throw bookingError('resource_not_found');
+      await connection.execute('SELECT id FROM courts WHERE id = ? FOR UPDATE', [initial[0].court_id]);
+      const [locked] = await connection.execute('SELECT id FROM bookings WHERE id = ? FOR UPDATE', [bookingId]);
+      if (!locked.length) throw bookingError('resource_not_found');
+      const previous = await loadBooking(connection, bookingId);
+      if (previous.userId !== userId) throw bookingError('forbidden');
+      const now = await readDatabaseNow(connection);
+      if (previous.status !== 'CONFIRMADA' || Temporal.Instant.compare(Temporal.Instant.from(now),
+        Temporal.Instant.from(previous.startAt)) >= 0) throw bookingError('invalid_booking_state');
+      const [approved] = await connection.execute(
+        `SELECT id, category FROM booking_exception_requests WHERE booking_id = ?
+         AND status = 'APROBADA' AND used_at IS NULL ORDER BY id DESC LIMIT 1 FOR UPDATE`, [bookingId],
+      );
+      if (!approved.length) throw bookingError('booking_cancellation_window_closed');
+      await connection.execute(
+        `UPDATE bookings SET status = 'CANCELADA', cancelled_at = ?, cancelled_by_user_id = ?,
+         cancellation_reason = 'CLIENTE_EXCEPCION', economic_outcome = 'REFUND_ALLOWED' WHERE id = ?`,
+        [toMySqlDateTime(now), userId, bookingId],
+      );
+      await connection.execute(
+        `UPDATE booking_exception_requests SET used_at = ?, economic_outcome = 'REFUND_ALLOWED' WHERE id = ?`,
+        [toMySqlDateTime(now), approved[0].id],
+      );
+      await recordBookingChange(connection, { bookingId, actorUserId: userId, type: 'CANCELLED_BY_CUSTOMER',
+        previous, reason: approved[0].category, outcome: 'REFUND_ALLOWED', now });
+      return { booking: await loadBooking(connection, bookingId), now };
+    });
+  }
+
+  async function listBookingChanges({ bookingId, userId }) {
+    const [owned] = await pool.execute('SELECT id FROM bookings WHERE id = ? AND user_id = ?', [bookingId, userId]);
+    if (!owned.length) return null;
+    const [rows] = await pool.execute(
+      `SELECT change_type, actor_user_id, previous_start_at, previous_end_at,
+         new_start_at, new_end_at, previous_price_minor, new_price_minor, reason, reason_code,
+        economic_outcome, created_at FROM booking_changes WHERE booking_id = ? ORDER BY id`, [bookingId],
+    );
+    return rows.map((row) => ({ type: row.change_type, actorUserId: String(row.actor_user_id),
+      previousStartAt: row.previous_start_at == null ? null : toInstantString(row.previous_start_at),
+      previousEndAt: row.previous_end_at == null ? null : toInstantString(row.previous_end_at),
+      newStartAt: row.new_start_at == null ? null : toInstantString(row.new_start_at),
+      newEndAt: row.new_end_at == null ? null : toInstantString(row.new_end_at),
+      previousPriceMinor: row.previous_price_minor == null ? null : Number(row.previous_price_minor),
+      newPriceMinor: row.new_price_minor == null ? null : Number(row.new_price_minor),
+      reason: row.reason, reasonCode: row.reason_code,
+      economicOutcome: row.economic_outcome, createdAt: toInstantString(row.created_at) }));
+  }
+
+  async function rescheduleBooking({ bookingId, userId, request, idempotencyKey, requestHash, decide, evaluate }) {
+    return runTransactionWithRetry(pool, async (connection) => {
+      const claim = await claimIdempotency(connection, { userId, idempotencyKey, requestHash,
+        operation: 'BOOKING_RESCHEDULE' });
+      if (claim.existing) {
+        if (!Buffer.from(claim.row.request_hash).equals(requestHash)) throw bookingError('invalid_idempotency_key_reuse');
+        if (claim.row.outcome !== 'SUCCEEDED' || String(claim.row.booking_id) !== bookingId) {
+          throw bookingError('invalid_idempotency_key_reuse');
+        }
+        return { booking: await loadBooking(connection, bookingId), replayed: true, now: await readDatabaseNow(connection) };
+      }
+      const [initial] = await connection.execute('SELECT court_id FROM bookings WHERE id = ?', [bookingId]);
+      if (!initial.length) throw bookingError('resource_not_found');
+      const courtId = String(initial[0].court_id);
+      const [locks] = await connection.execute('SELECT id FROM courts WHERE id = ? FOR UPDATE', [courtId]);
+      if (!locks.length) throw bookingError('resource_not_found');
+      const [locked] = await connection.execute('SELECT id FROM bookings WHERE id = ? FOR UPDATE', [bookingId]);
+      if (!locked.length) throw bookingError('resource_not_found');
+      const previous = await loadBooking(connection, bookingId);
+      const now = await readDatabaseNow(connection);
+      if (previous.userId !== userId) throw bookingError('forbidden');
+      const [exceptions] = await connection.execute(
+        `SELECT id FROM booking_exception_requests WHERE booking_id = ?
+         AND status = 'APROBADA' AND used_at IS NULL ORDER BY id DESC LIMIT 1 FOR UPDATE`, [bookingId],
+      );
+      const useException = decide({ booking: previous, now, exceptionApproved: exceptions.length > 0 });
+      const durationMinutes = Temporal.Instant.from(previous.startAt).until(previous.endAt).total('minutes');
+      const snapshot = await loadAvailabilityContext(connection, {
+        courtId, date: request.localDate, lockCourt: false,
+      });
+      if (!snapshot || isPublicCourt && !await isPublicCourt(connection, courtId, { requirePrice: false })) {
+        throw bookingError('resource_not_found');
+      }
+      const context = { ...snapshot.context, bookings: snapshot.context.bookings.filter((item) => item.id !== bookingId) };
+      const decision = evaluate({ context, now, request, durationMinutes });
+      if (!decision.accepted) throw bookingError(decision.code);
+      if (toInstantString(decision.option.startAt) === previous.startAt) throw bookingError('invalid_booking_option');
+      const [prices] = await connection.execute(
+        'SELECT price_amount_minor, currency FROM court_prices WHERE court_id = ? AND duration_minutes = ?',
+        [courtId, durationMinutes],
+      );
+      const currentPrice = prices[0] == null ? null : Number(prices[0].price_amount_minor);
+      if (currentPrice !== request.expectedPriceMinor || prices[0]?.currency !== 'COP' || request.currency !== 'COP') {
+        throw bookingError('booking_price_changed', { details: { currentPriceMinor: currentPrice, currency: 'COP' } });
+      }
+      const nextDeposit = Math.ceil(currentPrice * previous.depositPercentage / 100);
+      const surplus = Math.max(0, previous.amountPaidMinor - nextDeposit);
+      await connection.execute(
+        `UPDATE bookings SET start_at = ?, end_at = ?, price_amount_minor = ?, price_currency = 'COP',
+           deposit_amount_minor = ?, payment_status = ?, voluntary_reschedule_count = voluntary_reschedule_count + ?
+         WHERE id = ? AND status = 'CONFIRMADA'`,
+        [toMySqlDateTime(decision.option.startAt), toMySqlDateTime(decision.option.endAt), currentPrice,
+          nextDeposit, previous.amountPaidMinor >= nextDeposit ? 'PAGADO' : 'PENDIENTE',
+          useException ? 0 : 1, bookingId],
+      );
+      const [credited] = await connection.execute(
+        `SELECT COALESCE(SUM(amount_minor), 0) AS amount FROM customer_credit_ledger
+         WHERE booking_id = ? AND reason = 'RESCHEDULE_SURPLUS' FOR UPDATE`, [bookingId],
+      );
+      const additionalCredit = Math.max(0, surplus - Number(credited[0].amount));
+      if (additionalCredit > 0) await grantCredit(connection, { facilityId: previous.facility.id,
+        userId, bookingId, amountMinor: additionalCredit, now });
+      if (useException) await connection.execute(
+        'UPDATE booking_exception_requests SET used_at = ? WHERE id = ? AND used_at IS NULL',
+        [toMySqlDateTime(now), exceptions[0].id],
+      );
+      const booking = await loadBooking(connection, bookingId);
+      await recordBookingChange(connection, { bookingId, actorUserId: userId, type: 'RESCHEDULED',
+        previous, next: booking, outcome: useException ? 'RESCHEDULE_PRIORITY' : 'NOT_APPLICABLE', now });
+      const [updated] = await connection.execute(
+        `UPDATE idempotency_records SET outcome = 'SUCCEEDED', booking_id = ?, completed_at = ?
+         WHERE id = ? AND outcome IS NULL`, [bookingId, toMySqlDateTime(now), claim.id],
+      );
+      if (updated.affectedRows !== 1) throw bookingError('internal_error');
+      return { booking, previous, replayed: false, now };
+    });
+  }
+
+  async function requestBookingException({ bookingId, userId, category, note }) {
+    return runTransactionWithRetry(pool, async (connection) => {
+      const [initial] = await connection.execute('SELECT court_id FROM bookings WHERE id = ?', [bookingId]);
+      if (!initial.length) throw bookingError('resource_not_found');
+      await connection.execute('SELECT id FROM courts WHERE id = ? FOR UPDATE', [initial[0].court_id]);
+      const booking = await loadBooking(connection, bookingId);
+      if (booking.userId !== userId) throw bookingError('forbidden');
+      const now = await readDatabaseNow(connection);
+      if (booking.status !== 'CONFIRMADA' || booking.noShowAt || Temporal.Instant.compare(Temporal.Instant.from(now),
+        Temporal.Instant.from(booking.endAt)) >= 0) throw bookingError('invalid_booking_state');
+      const [pending] = await connection.execute(
+        "SELECT id FROM booking_exception_requests WHERE booking_id = ? AND status = 'PENDIENTE' FOR UPDATE", [bookingId],
+      );
+      if (pending.length) throw bookingError('booking_exception_pending');
+      const [insert] = await connection.execute(
+        `INSERT INTO booking_exception_requests (booking_id, category, note, status, requested_by_user_id, requested_at)
+         VALUES (?, ?, ?, 'PENDIENTE', ?, ?)`, [bookingId, category, note ?? null, userId, toMySqlDateTime(now)],
+      );
+      return { id: String(insert.insertId), bookingId, category, status: 'PENDIENTE', requestedAt: now };
+    });
+  }
+
+  async function decideBookingException({ exceptionId, ownerUserId, decision }) {
+    return runTransactionWithRetry(pool, async (connection) => {
+      const [initial] = await connection.execute(
+        `SELECT c.id AS court_id, c.facility_id FROM booking_exception_requests AS e
+         JOIN bookings AS b ON b.id = e.booking_id JOIN courts AS c ON c.id = b.court_id WHERE e.id = ?`, [exceptionId],
+      );
+      if (!initial.length) throw bookingError('resource_not_found');
+      await connection.execute('SELECT id FROM courts WHERE id = ? FOR UPDATE', [initial[0].court_id]);
+      await requireActiveMembership(connection, { facilityId: initial[0].facility_id, userId: ownerUserId, lock: true });
+      const [rows] = await connection.execute(
+        'SELECT booking_id, category, status FROM booking_exception_requests WHERE id = ? FOR UPDATE', [exceptionId],
+      );
+      if (rows[0].status !== 'PENDIENTE') throw bookingError('invalid_booking_state');
+      const booking = await loadBooking(connection, rows[0].booking_id);
+      if (booking.status !== 'CONFIRMADA' || booking.noShowAt) throw bookingError('invalid_booking_state');
+      const now = await readDatabaseNow(connection);
+      await connection.execute(
+        `UPDATE booking_exception_requests SET status = ?, resolved_by_user_id = ?, resolved_at = ?,
+         economic_outcome = ? WHERE id = ?`,
+        [decision, ownerUserId, toMySqlDateTime(now),
+          decision === 'APROBADA' ? 'RESCHEDULE_PRIORITY' : 'NOT_APPLICABLE', exceptionId],
+      );
+      return { exception: { id: exceptionId, bookingId: booking.id, category: rows[0].category,
+        status: decision }, booking };
+    });
+  }
+
+  async function listOwnerExceptions({ ownerUserId }) {
+    const [rows] = await pool.execute(
+      `SELECT e.id, e.booking_id, e.category, e.note, e.status, e.requested_at,
+        c.name AS court_name, f.name AS facility_name, u.name AS customer_name
+       FROM booking_exception_requests AS e
+       JOIN bookings AS b ON b.id = e.booking_id
+       JOIN courts AS c ON c.id = b.court_id
+       JOIN facilities AS f ON f.id = c.facility_id
+       JOIN users AS u ON u.id = b.user_id
+       JOIN facility_memberships AS m ON m.facility_id = f.id AND m.user_id = ?
+         AND m.active = 1 AND m.membership_type = 'PROPIETARIO'
+       JOIN users AS owner ON owner.id = m.user_id AND owner.deactivated_at IS NULL
+         AND owner.owner_suspended_at IS NULL
+       JOIN user_roles AS r ON r.user_id = owner.id AND r.role_code = 'PROPIETARIO'
+       WHERE e.status = 'PENDIENTE' ORDER BY e.requested_at DESC, e.id DESC LIMIT 100`, [ownerUserId],
+    );
+    return rows.map((row) => ({ id: String(row.id), bookingId: String(row.booking_id),
+      category: row.category, note: row.note, status: row.status, requestedAt: toInstantString(row.requested_at),
+      courtName: row.court_name, facilityName: row.facility_name, customerName: row.customer_name }));
+  }
+
+  async function cancelOwnerBooking({ bookingId, ownerUserId, reason, reasonCode }) {
+    return runTransactionWithRetry(pool, async (connection) => {
+      const [initial] = await connection.execute(
+        'SELECT c.id AS court_id, c.facility_id FROM bookings b JOIN courts c ON c.id = b.court_id WHERE b.id = ?', [bookingId],
+      );
+      if (!initial.length) throw bookingError('resource_not_found');
+      await connection.execute('SELECT id FROM courts WHERE id = ? FOR UPDATE', [initial[0].court_id]);
+      await requireActiveMembership(connection, { facilityId: initial[0].facility_id, userId: ownerUserId, lock: true });
+      const booking = await loadBooking(connection, bookingId);
+      const now = await readDatabaseNow(connection);
+      if (booking.status !== 'CONFIRMADA' || Temporal.Instant.compare(Temporal.Instant.from(now),
+        Temporal.Instant.from(booking.endAt)) >= 0 || booking.noShowAt) throw bookingError('invalid_booking_state');
+      await connection.execute(
+        `UPDATE bookings SET status = 'CANCELADA', cancelled_at = ?, cancelled_by_user_id = ?,
+         cancellation_reason = 'CANCELLED_BY_OWNER', economic_outcome = 'FULL_REFUND_OR_RESCHEDULE'
+         WHERE id = ? AND status = 'CONFIRMADA'`, [toMySqlDateTime(now), ownerUserId, bookingId],
+      );
+      await recordBookingChange(connection, { bookingId, actorUserId: ownerUserId, type: 'CANCELLED_BY_OWNER',
+        previous: booking, reason, reasonCode, outcome: 'FULL_REFUND_OR_RESCHEDULE', now });
+      return { booking: await loadBooking(connection, bookingId), reason };
+    });
+  }
+
+  async function markNoShow({ bookingId, ownerUserId }) {
+    return runTransactionWithRetry(pool, async (connection) => {
+      const [initial] = await connection.execute(
+        'SELECT c.id AS court_id, c.facility_id FROM bookings b JOIN courts c ON c.id = b.court_id WHERE b.id = ?', [bookingId],
+      );
+      if (!initial.length) throw bookingError('resource_not_found');
+      await connection.execute('SELECT id FROM courts WHERE id = ? FOR UPDATE', [initial[0].court_id]);
+      await requireActiveMembership(connection, { facilityId: initial[0].facility_id, userId: ownerUserId, lock: true });
+      const booking = await loadBooking(connection, bookingId);
+      const now = await readDatabaseNow(connection);
+      if (booking.status !== 'CONFIRMADA') throw bookingError('invalid_booking_state');
+      if (Temporal.Instant.compare(Temporal.Instant.from(now), Temporal.Instant.from(booking.startAt)) < 0) {
+        throw bookingError('booking_not_started');
+      }
+      if (booking.noShowAt) return { booking, changed: false };
+      await connection.execute(
+        `UPDATE bookings SET no_show_at = ?, no_show_by_user_id = ?, economic_outcome = 'NON_REFUNDABLE'
+         WHERE id = ? AND no_show_at IS NULL`, [toMySqlDateTime(now), ownerUserId, bookingId],
+      );
+      await recordBookingChange(connection, { bookingId, actorUserId: ownerUserId,
+        type: 'NO_SHOW', previous: booking, outcome: 'NON_REFUNDABLE', now });
+      return { booking: await loadBooking(connection, bookingId), changed: true };
+    });
+  }
+
+  async function updateCancellationPolicy({ courtId, ownerUserId, minutes }) {
+    return runTransactionWithRetry(pool, async (connection) => {
+      const [courts] = await connection.execute(
+        'SELECT id, facility_id, cancellation_min_minutes FROM courts WHERE id = ? FOR UPDATE', [courtId],
+      );
+      if (!courts.length) throw bookingError('resource_not_found');
+      await requireActiveMembership(connection, { facilityId: courts[0].facility_id, userId: ownerUserId, lock: true });
+      const changed = Number(courts[0].cancellation_min_minutes) !== minutes;
+      if (changed) await connection.execute('UPDATE courts SET cancellation_min_minutes = ? WHERE id = ?', [minutes, courtId]);
+      return { courtId, cancellationMinMinutes: minutes, changed };
+    });
+  }
+
+  async function updateDepositPolicy({ courtId, ownerUserId, percentage }) {
+    return runTransactionWithRetry(pool, async (connection) => {
+      const [courts] = await connection.execute(
+        'SELECT id, facility_id, deposit_percentage FROM courts WHERE id = ? FOR UPDATE', [courtId],
+      );
+      if (!courts.length) throw bookingError('resource_not_found');
+      await requireActiveMembership(connection, { facilityId: courts[0].facility_id, userId: ownerUserId, lock: true });
+      const changed = Number(courts[0].deposit_percentage) !== percentage;
+      if (changed) await connection.execute('UPDATE courts SET deposit_percentage = ? WHERE id = ?', [percentage, courtId]);
+      return { courtId, depositPercentage: percentage, changed };
     });
   }
 
@@ -425,9 +874,10 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
           facility_id: facility.id,
           facility_name: facility.name,
           name: court.name,
-          description: court.description ?? null,
+           description: court.description ?? null,
           sport_code: court.sportCode ?? null,
-          minimum_separation_minutes: court.minimumSeparationMinutes,
+           minimum_separation_minutes: court.minimumSeparationMinutes,
+           cancellation_min_minutes: 120,
           start_interval_minutes: court.startIntervalMinutes,
           created_at: now,
           deactivated_at: null,
@@ -923,7 +1373,7 @@ async function lockAdminCourt(connection, courtId) {
 async function loadAdminCourt(executor, courtId) {
   const [rows] = await executor.execute(
     `SELECT c.id, c.facility_id, c.name, c.description, c.sport_code,
-            c.minimum_separation_minutes, c.start_interval_minutes,
+              c.minimum_separation_minutes, c.start_interval_minutes, c.cancellation_min_minutes, c.deposit_percentage,
             c.created_at, c.deactivated_at, f.name AS facility_name,
             f.timezone, f.minimum_advance_minutes, f.maximum_advance_minutes,
             f.deactivated_at AS facility_deactivated_at
@@ -1085,6 +1535,8 @@ function mapAdminCourt(row) {
     description: row.description,
     ...(Object.hasOwn(row, 'sport_code') ? { sportCode: row.sport_code } : {}),
     minimumSeparationMinutes: Number(row.minimum_separation_minutes),
+    cancellationMinMinutes: Number(row.cancellation_min_minutes),
+    depositPercentage: Number(row.deposit_percentage),
     startIntervalMinutes: Number(row.start_interval_minutes),
     allowedDurationsMinutes: row.durations ?? [],
     createdAt: toInstantString(row.created_at),
@@ -1097,6 +1549,8 @@ function presentBookingConfiguration(court) {
   return {
     courtId: String(court.id),
     minimumSeparationMinutes: Number(court.minimum_separation_minutes),
+    cancellationMinMinutes: Number(court.cancellation_min_minutes),
+    depositPercentage: Number(court.deposit_percentage),
     startIntervalMinutes: Number(court.start_interval_minutes),
     allowedDurationsMinutes: court.durations,
   };
@@ -1304,7 +1758,8 @@ async function loadAvailabilityContext(connection, { courtId, date, lockCourt })
   }
 
   const [courtRows] = await connection.execute(
-    `SELECT c.id, c.name, c.facility_id, c.minimum_separation_minutes,
+    `SELECT c.id, c.name, c.facility_id, c.minimum_separation_minutes, c.cancellation_min_minutes,
+             c.deposit_percentage,
             c.start_interval_minutes, f.name AS facility_name, f.timezone,
             f.minimum_advance_minutes, f.maximum_advance_minutes
      FROM courts AS c
@@ -1366,7 +1821,7 @@ async function loadAvailabilityContext(connection, { courtId, date, lockCourt })
     `SELECT id, start_at, end_at, status
      FROM bookings
      WHERE court_id = ?
-       AND status = 'CONFIRMADA'
+        AND (status = 'CONFIRMADA' OR (status = 'PENDIENTE_PAGO' AND payment_expires_at > UTC_TIMESTAMP(6)))
        AND start_at < ?
        AND end_at > ?
      ORDER BY start_at, id`,
@@ -1383,7 +1838,9 @@ async function loadAvailabilityContext(connection, { courtId, date, lockCourt })
   );
 
   return {
-    court: { id: String(court.id), name: court.name },
+    court: { id: String(court.id), name: court.name,
+      cancellationMinMinutes: Number(court.cancellation_min_minutes),
+      depositPercentage: Number(court.deposit_percentage) },
     facility: { id: String(court.facility_id), name: court.facility_name },
     context: {
       date,
@@ -1511,13 +1968,13 @@ function mapUnavailabilityDiscarded(row) { return { id: String(row.id), courtId:
 function conflictSelect() { return `SELECT cf.id, cf.detected_at, cf.resolved_at, b.id AS booking_id, b.user_id AS booking_user_id, b.court_id AS booking_court_id, b.start_at AS booking_start_at, b.end_at AS booking_end_at, b.booking_timezone, oc.id AS change_id, oc.court_id AS change_court_id, oc.change_type, oc.actor_user_id, oc.occurred_at FROM operational_conflicts cf INNER JOIN bookings b ON b.id = cf.booking_id INNER JOIN operational_changes oc ON oc.id = cf.operational_change_id`; }
 function mapConflict(row) { return { id: String(row.id), detectedAt: toInstantString(row.detected_at), resolvedAt: row.resolved_at == null ? null : toInstantString(row.resolved_at), booking: { id: String(row.booking_id), courtId: String(row.booking_court_id), userId: String(row.booking_user_id), startAt: toInstantString(row.booking_start_at), endAt: toInstantString(row.booking_end_at), timeZone: row.booking_timezone }, operationalChange: { id: String(row.change_id), courtId: String(row.change_court_id), type: row.change_type, actorUserId: String(row.actor_user_id), occurredAt: toInstantString(row.occurred_at) } }; }
 
-async function claimIdempotency(connection, { userId, idempotencyKey, requestHash }) {
+async function claimIdempotency(connection, { userId, idempotencyKey, requestHash, operation = 'CONFIRM_BOOKING' }) {
   try {
     const [result] = await connection.execute(
       `INSERT INTO idempotency_records
          (user_id, operation, idempotency_key, request_hash)
-       VALUES (?, 'CONFIRM_BOOKING', ?, ?)`,
-      [userId, Buffer.from(idempotencyKey, 'ascii'), requestHash],
+        VALUES (?, ?, ?, ?)`,
+      [userId, operation, Buffer.from(idempotencyKey, 'ascii'), requestHash],
     );
     return { id: String(result.insertId), existing: false };
   } catch (error) {
@@ -1527,10 +1984,10 @@ async function claimIdempotency(connection, { userId, idempotencyKey, requestHas
               result_price_amount_minor, result_price_currency
        FROM idempotency_records
        WHERE user_id = ?
-         AND operation = 'CONFIRM_BOOKING'
+          AND operation = ?
          AND idempotency_key = ?
        FOR UPDATE`,
-      [userId, Buffer.from(idempotencyKey, 'ascii')],
+      [userId, operation, Buffer.from(idempotencyKey, 'ascii')],
     );
     if (rows.length !== 1) throw bookingError('internal_error');
     return { id: String(rows[0].id), existing: true, row: rows[0] };
@@ -1556,6 +2013,73 @@ async function readDatabaseNow(connection) {
   return toInstantString(rows[0].now_utc);
 }
 
+async function expirePendingBookings(connection, courtId) {
+  // This uses database time so a process clock cannot retain an expired checkout hold.
+  await connection.execute(
+    `UPDATE bookings SET payment_status = 'EXPIRED'
+     WHERE court_id = ? AND status = 'PENDIENTE_PAGO' AND payment_expires_at <= UTC_TIMESTAMP(6)`,
+    [courtId],
+  );
+}
+
+async function spendCredit(connection, { facilityId, userId, requestedMinor, now }) {
+  if (requestedMinor === 0) return 0;
+  await connection.execute(
+    `INSERT IGNORE INTO customer_credit_balances (facility_id, user_id, balance_minor, updated_at)
+     VALUES (?, ?, 0, ?)`, [facilityId, userId, toMySqlDateTime(now)],
+  );
+  const [rows] = await connection.execute(
+    'SELECT balance_minor FROM customer_credit_balances WHERE facility_id = ? AND user_id = ? FOR UPDATE',
+    [facilityId, userId],
+  );
+  const applied = Math.min(requestedMinor, Number(rows[0].balance_minor));
+  if (applied) await connection.execute(
+    `UPDATE customer_credit_balances SET balance_minor = balance_minor - ?, updated_at = ?
+     WHERE facility_id = ? AND user_id = ?`, [applied, toMySqlDateTime(now), facilityId, userId],
+  );
+  return applied;
+}
+
+async function attachCreditSpend(connection, { facilityId, userId, bookingId, amountMinor, now }) {
+  await connection.execute(
+    `INSERT INTO customer_credit_ledger (facility_id, user_id, booking_id, amount_minor, reason, created_at)
+     VALUES (?, ?, ?, ?, 'DEPOSIT_CREDIT_APPLIED', ?)`,
+    [facilityId, userId, bookingId, -amountMinor, toMySqlDateTime(now)],
+  );
+}
+
+async function grantCredit(connection, { facilityId, userId, bookingId, amountMinor, now }) {
+  if (amountMinor <= 0) return;
+  await connection.execute(
+    `INSERT IGNORE INTO customer_credit_balances (facility_id, user_id, balance_minor, updated_at)
+     VALUES (?, ?, 0, ?)`, [facilityId, userId, toMySqlDateTime(now)],
+  );
+  await connection.execute(
+    'SELECT balance_minor FROM customer_credit_balances WHERE facility_id = ? AND user_id = ? FOR UPDATE',
+    [facilityId, userId],
+  );
+  await connection.execute(
+    `UPDATE customer_credit_balances SET balance_minor = balance_minor + ?, updated_at = ?
+     WHERE facility_id = ? AND user_id = ?`, [amountMinor, toMySqlDateTime(now), facilityId, userId],
+  );
+  await connection.execute(
+    `INSERT INTO customer_credit_ledger (facility_id, user_id, booking_id, amount_minor, reason, created_at)
+     VALUES (?, ?, ?, ?, 'RESCHEDULE_SURPLUS', ?)`,
+    [facilityId, userId, bookingId, amountMinor, toMySqlDateTime(now)],
+  );
+}
+
+function checkoutFor(booking, dueMinor) {
+  return {
+    depositPercentage: booking.depositPercentage,
+    depositAmountMinor: booking.depositAmountMinor,
+    creditAppliedMinor: (booking.amountPaidMinor ?? 0),
+    amountDueMinor: dueMinor,
+    currency: 'COP',
+    expiresAt: booking.paymentExpiresAt,
+  };
+}
+
 async function loadPriceMap(connection, courtId) {
   const [rows] = await connection.execute(
     "SELECT duration_minutes, price_amount_minor FROM court_prices WHERE court_id = ? AND currency = 'COP'",
@@ -1573,12 +2097,33 @@ async function loadBooking(connection, bookingId) {
   return rows.length === 0 ? null : mapBooking(rows[0]);
 }
 
+async function recordBookingChange(connection, { bookingId, actorUserId, type, previous, next,
+  reason = null, reasonCode = null, outcome, now }) {
+  await connection.execute(
+    `INSERT INTO booking_changes (booking_id, change_type, actor_user_id,
+      previous_start_at, previous_end_at, new_start_at, new_end_at,
+      previous_price_minor, new_price_minor, reason_code, reason, economic_outcome, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [bookingId, type, actorUserId,
+      previous ? toMySqlDateTime(previous.startAt) : null,
+      previous ? toMySqlDateTime(previous.endAt) : null,
+      next ? toMySqlDateTime(next.startAt) : null,
+      next ? toMySqlDateTime(next.endAt) : null,
+      previous?.priceMinor ?? null, next?.priceMinor ?? null, reasonCode, reason, outcome, toMySqlDateTime(now)],
+  );
+}
+
 function bookingSelect() {
   return `SELECT b.id, b.user_id, b.start_at, b.end_at, b.booking_timezone,
-                 b.status, b.created_at, b.cancelled_at, b.price_amount_minor, b.price_currency,
+                  b.status, b.created_at, b.cancelled_at, b.price_amount_minor, b.price_currency,
+                   b.cancellation_min_minutes, b.cancellation_reason, b.economic_outcome, b.no_show_at,
+                   b.deposit_percentage_snapshot, b.deposit_amount_minor, b.amount_paid_minor,
+                    b.payment_status, b.payment_expires_at, b.voluntary_reschedule_count,
+                  EXISTS (SELECT 1 FROM booking_exception_requests AS e
+                    WHERE e.booking_id = b.id AND e.status = 'APROBADA' AND e.used_at IS NULL) AS exception_approved,
                   c.id AS court_id, c.name AS court_name,
                   f.id AS facility_id, f.name AS facility_name,
-                  customer.name AS customer_name
+                  customer.name AS customer_name, customer.email AS customer_email
            FROM bookings AS b
            INNER JOIN courts AS c ON c.id = b.court_id
            INNER JOIN facilities AS f ON f.id = c.facility_id
@@ -1590,6 +2135,7 @@ function mapBooking(row) {
     id: String(row.id),
     userId: String(row.user_id),
     customerName: row.customer_name,
+    customerEmail: row.customer_email,
     court: { id: String(row.court_id), name: row.court_name },
     facility: { id: String(row.facility_id), name: row.facility_name },
     startAt: toInstantString(row.start_at),
@@ -1597,6 +2143,17 @@ function mapBooking(row) {
     timeZone: row.booking_timezone,
     priceMinor: row.price_amount_minor == null ? null : Number(row.price_amount_minor),
     currency: row.price_currency,
+    cancellationMinMinutes: Number(row.cancellation_min_minutes),
+    cancellationReason: row.cancellation_reason,
+    economicOutcome: row.economic_outcome,
+    noShowAt: row.no_show_at == null ? null : toInstantString(row.no_show_at),
+    depositPercentage: row.deposit_percentage_snapshot == null ? null : Number(row.deposit_percentage_snapshot),
+    depositAmountMinor: row.deposit_amount_minor == null ? null : Number(row.deposit_amount_minor),
+    amountPaidMinor: row.amount_paid_minor == null ? null : Number(row.amount_paid_minor),
+    paymentStatus: row.payment_status,
+    paymentExpiresAt: row.payment_expires_at == null ? null : toInstantString(row.payment_expires_at),
+    voluntaryRescheduleCount: row.voluntary_reschedule_count == null ? null : Number(row.voluntary_reschedule_count),
+    exceptionApproved: Boolean(row.exception_approved),
     status: row.status,
     createdAt: toInstantString(row.created_at),
     cancelledAt: row.cancelled_at == null ? null : toInstantString(row.cancelled_at),
@@ -1611,6 +2168,7 @@ function mapBookingState(row) {
     startAt: toInstantString(row.start_at),
     endAt: toInstantString(row.end_at),
     status: row.status,
+    cancellationMinMinutes: Number(row.cancellation_min_minutes),
     cancelledAt: row.cancelled_at == null ? null : toInstantString(row.cancelled_at),
     cancelledByUserId: row.cancelled_by_user_id == null
       ? null

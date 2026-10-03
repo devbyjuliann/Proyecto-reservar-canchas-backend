@@ -95,6 +95,11 @@ describe('owner bookings with MySQL and real sessions', { skip: !available, time
       );
       fixture.bookings.push(String(result.insertId));
     }
+    await pool.execute(
+      `UPDATE bookings SET payment_status = 'PAGADO', deposit_percentage_snapshot = 30,
+       deposit_amount_minor = 2700000, amount_paid_minor = 2700000, voluntary_reschedule_count = 1
+       WHERE id = ?`, [fixture.bookings[0]],
+    );
     const users = createMySqlUsersAdapter({ pool });
     const booking = createBookingModule({ adapter: createMySqlBookingAdapter({ pool }), clock });
     const facilities = createFacilitiesModule({ adapter: createMySqlFacilitiesAdapter({ pool }), clock });
@@ -109,7 +114,10 @@ describe('owner bookings with MySQL and real sessions', { skip: !available, time
   after(async () => {
     if (!pool) return;
     try {
-      for (const id of fixture.bookings) await pool.execute('DELETE FROM bookings WHERE id = ?', [id]);
+      for (const id of fixture.bookings) {
+        await pool.execute('DELETE FROM booking_changes WHERE booking_id = ?', [id]);
+        await pool.execute('DELETE FROM bookings WHERE id = ?', [id]);
+      }
       for (const id of fixture.memberships) {
         await pool.execute('DELETE FROM facility_memberships WHERE id = ?', [id]);
       }
@@ -136,6 +144,12 @@ describe('owner bookings with MySQL and real sessions', { skip: !available, time
     assert.equal(completed.currency, null);
     assert.equal(a.body.items.find((item) => item.status === 'CANCELADA').persistedStatus, 'CANCELADA');
     assert.equal(a.body.items.find((item) => item.priceMinor === PRICE).currency, 'COP');
+    const paid = a.body.items.find((item) => item.id === fixture.bookings[0]);
+    assert.deepEqual({ paymentStatus: paid.paymentStatus, depositPercentage: paid.depositPercentage,
+      depositAmountMinor: paid.depositAmountMinor, amountPaidMinor: paid.amountPaidMinor,
+      paymentExpiresAt: paid.paymentExpiresAt, voluntaryRescheduleCount: paid.voluntaryRescheduleCount },
+    { paymentStatus: 'PAGADO', depositPercentage: 30, depositAmountMinor: 2700000,
+      amountPaidMinor: 2700000, paymentExpiresAt: null, voluntaryRescheduleCount: 1 });
     const shared = await get('shared').expect(200);
     assert.deepEqual(shared.body.items.map((item) => item.id), a.body.items.map((item) => item.id));
     const b = await get('ownerB').expect(200);

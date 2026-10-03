@@ -6,6 +6,7 @@ export {
   validateAvailabilityRequest,
   validateCancellationRequest,
   validateConfirmationRequest,
+  validateFacilityCreditRequest,
   validateIdempotencyKey,
   validateOwnBookingsRequest,
 } from './validation.js';

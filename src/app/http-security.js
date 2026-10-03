@@ -2,7 +2,7 @@ import { appError } from '../shared/errors.js';
 
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 const ALLOWED_METHODS = 'GET, POST, PUT, PATCH, DELETE, OPTIONS';
-const ALLOWED_HEADERS = 'Content-Type, Idempotency-Key';
+const ALLOWED_HEADERS = 'Content-Type, Idempotency-Key, X-Booking-Start-At';
 
 export function createHttpSecurity({ environment, frontendOrigin }) {
   if (typeof frontendOrigin !== 'string' || frontendOrigin === '') {

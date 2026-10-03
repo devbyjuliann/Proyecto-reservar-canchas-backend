@@ -9,6 +9,7 @@ import { createPublicCatalogRouter } from '../modules/public-catalog/index.js';
 import { createCourtPricingRouter } from '../modules/court-pricing/index.js';
 import { createOwnerOperationsRouter } from '../modules/owner/http.js';
 import { createOwnerDirectoryRouter } from '../modules/owner-directory/index.js';
+import { createPaymentsRouter, createWompiWebhookRouter } from '../modules/payments/index.js';
 import { createErrorHandler, notFoundHandler } from './error-handler.js';
 import { createHttpSecurity } from './http-security.js';
 import { createRequestContext } from './request-context.js';
@@ -26,12 +27,15 @@ export function createApp({
   environment,
   frontendOrigin = 'http://localhost:5173',
   logger = console,
+  wompi,
 }) {
   const app = express();
   app.disable('x-powered-by');
   if (environment === 'production') app.set('trust proxy', 'loopback');
-  app.use(createHttpSecurity({ environment, frontendOrigin }));
   app.use(express.json({ limit: '32kb', strict: true, type: 'application/json' }));
+  // Provider callbacks are machine-to-machine requests, not browser mutations.
+  app.use(createWompiWebhookRouter({ booking, wompi }));
+  app.use(createHttpSecurity({ environment, frontendOrigin }));
 
   app.get('/health', (_request, response) => {
     response.json({ status: 'ok' });
@@ -58,6 +62,7 @@ export function createApp({
     memberships, facilities, booking, requireIdentity,
   }));
   app.use(createBookingRouter({ booking, requireIdentity, catalog }));
+  app.use(createPaymentsRouter({ booking, wompi, requireIdentity }));
   if (facilities) app.use(createAdminRouter({ facilities, booking, requireIdentity }));
   app.use(notFoundHandler);
   app.use(createErrorHandler({ logger }));

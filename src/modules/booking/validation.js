@@ -36,6 +36,7 @@ const confirmationSchema = z.object({
   durationMinutes: z.number().int().positive().max(65_535),
   expectedPriceMinor: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
   currency: z.literal('COP'),
+  useCreditMinor: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
 }).strict();
 
 const ownBookingsSchema = z.object({
@@ -75,6 +76,26 @@ export function validateOwnBookingsRequest(input) {
 
 export function validateCancellationRequest(input) {
   return parse(z.object({ bookingId: idSchema }).strict(), input);
+}
+
+export function validateFacilityCreditRequest(input) {
+  return parse(z.object({ facilityId: idSchema }).strict(), input);
+}
+
+export function validateRescheduleRequest(input) {
+  return parse(z.object({ localDate: localDateSchema, startTime: localTimeSchema,
+    expectedPriceMinor: confirmationSchema.shape.expectedPriceMinor, currency: z.literal('COP') }).strict(), input);
+}
+
+export function validateExceptionRequest(input) {
+  return parse(z.object({ category: z.enum(['MAL_CLIMA', 'FUERZA_MAYOR']),
+    note: z.string().trim().min(1).max(500).optional() }).strict(), input);
+}
+
+export function validateOwnerCancellation(input) {
+  return parse(z.object({ reasonCode: z.enum(['COURT_DAMAGE', 'URGENT_MAINTENANCE',
+    'UNEXPECTED_CLOSURE', 'EXTRAORDINARY_UNAVAILABILITY']),
+  reason: z.string().trim().min(1).max(500) }).strict(), input);
 }
 
 export function validateIdempotencyKey(value) {

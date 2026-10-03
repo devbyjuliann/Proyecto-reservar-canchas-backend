@@ -65,7 +65,7 @@ describe('owner booking emails', () => {
     assert.equal(sent[0].subject, 'Nueva reserva recibida - Reserva Canchas');
     for (const detail of ['Recibiste una nueva reserva', 'Cliente Reserva', 'La Pista', 'Cancha Norte',
       '10 de octubre de 2026', '18:00 - 19:00', '60 minutos', '$50.000 COP',
-      'Estado: Confirmada', 'https://canchapp.online/owner/bookings']) {
+      'Estado: Confirmada', 'https://canchapp.online/owner/reservas']) {
       assert.ok(sent[0].text.includes(detail), detail);
     }
     assert.equal(sent[0].text.includes('23:00'), false);
@@ -84,5 +84,41 @@ describe('owner booking emails', () => {
     }
     assert.equal(message.text.toLowerCase().includes('reembolso'), false);
     assert.equal(message.text.toLowerCase().includes('ya está disponible'), false);
+  });
+});
+
+describe('booking lifecycle emails', () => {
+  it('shows before/after time and price to customer and owner without leaking HTML', async () => {
+    const sent = [];
+    const notifier = createBookingEmailNotifier({ frontendOrigin: 'https://canchapp.online',
+      sendEmail: async (message) => { sent.push(message); } });
+    const next = { ...BOOKING, court: { name: '<Cancha Sur>' },
+      startAt: '2026-10-11T00:00:00.000000Z', endAt: '2026-10-11T01:00:00.000000Z',
+      priceMinor: 6000000 };
+    await notifier.reschedule({ email: 'customer@example.test', previous: BOOKING, booking: next });
+    await notifier.ownerReschedule({ email: 'owner@example.test', previous: BOOKING, booking: next });
+    assert.deepEqual(sent.map((message) => message.subject),
+      ['Tu reserva fue modificada - Reserva Canchas', 'Una reserva fue modificada - Reserva Canchas']);
+    for (const message of sent) {
+      for (const detail of ['18:00', '19:00', '20:00', '$50.000 COP', '$60.000 COP', 'Estado: Confirmada']) {
+        assert.ok(message.text.includes(detail), detail);
+      }
+      assert.ok(message.html.includes('&lt;Cancha Sur&gt;'));
+      assert.equal(message.html.includes('<Cancha Sur>'), false);
+    }
+  });
+
+  it('distinguishes an establishment cancellation from a customer cancellation and notifies exception decision', async () => {
+    const sent = [];
+    const notifier = createBookingEmailNotifier({ frontendOrigin: 'https://canchapp.online',
+      sendEmail: async (message) => { sent.push(message); } });
+    await notifier.customerOwnerCancellation({ email: 'customer@example.test', booking: BOOKING,
+      reason: 'Daño de Cancha' });
+    await notifier.exceptionDecision({ email: 'customer@example.test', booking: BOOKING,
+      category: 'MAL_CLIMA', decision: 'APROBADA' });
+    assert.ok(sent[0].subject.includes('cancelada por el establecimiento'));
+    assert.ok(sent[0].text.includes('Daño de Cancha'));
+    assert.ok(sent[0].text.includes('No se ha procesado ninguna devolución'));
+    assert.ok(sent[1].text.includes('Mal clima: Aprobada'));
   });
 });

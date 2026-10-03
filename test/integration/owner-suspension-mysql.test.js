@@ -102,7 +102,10 @@ describe('global owner moderation with MySQL and real cookies', { skip: !availab
   after(async () => {
     if (!pool) return;
     try {
-      for (const id of ids.bookings) await pool.execute('DELETE FROM bookings WHERE id = ?', [id]);
+      for (const id of ids.bookings) {
+        await pool.execute('DELETE FROM booking_changes WHERE booking_id = ?', [id]);
+        await pool.execute('DELETE FROM bookings WHERE id = ?', [id]);
+      }
       for (const id of ids.courts) {
         await pool.execute('DELETE FROM operational_conflicts WHERE operational_change_id IN (SELECT id FROM operational_changes WHERE court_id = ?)', [id]);
         await pool.execute('DELETE FROM operational_changes WHERE court_id = ?', [id]);

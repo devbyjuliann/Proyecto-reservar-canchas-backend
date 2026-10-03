@@ -23,6 +23,7 @@ import {
   createMySqlBookingAdapter,
 } from '../../src/modules/booking/index.js';
 import { createSystemClock } from '../../src/shared/clock.js';
+import { toInstantString, toMySqlDateTime } from '../../src/shared/time.js';
 
 const REQUIRED_DB_ENV = ['DB_HOST', 'DB_PORT', 'DB_USER', 'DB_PASSWORD', 'DB_NAME'];
 const MYSQL_AVAILABLE = process.env.NODE_ENV === 'test'
@@ -64,6 +65,13 @@ describe('booking MySQL integration', { skip: !MYSQL_AVAILABLE, timeout: 30_000 
     await cleanFixture(pool, fixture);
   });
 
+  async function confirmPaid(module, actor, bookingRequest, idempotencyKey) {
+    const created = await module.confirmBooking({ actor, request: bookingRequest, idempotencyKey });
+    const approved = await module.approveTestPayment({ bookingId: created.booking.id,
+      providerReference: `test-${randomUUID()}`, amountMinor: created.checkout.amountDueMinor });
+    return { ...created, booking: approved.booking };
+  }
+
   it('confirms once, replays the same result, and rejects another payload', async () => {
     const request = fixture.request;
     const first = await bookingModule.confirmBooking({
@@ -99,6 +107,57 @@ describe('booking MySQL integration', { skip: !MYSQL_AVAILABLE, timeout: 30_000 
     );
     assert.equal(Number(bookingRows[0].count), 1);
     assert.equal(Number(idempotencyRows[0].count), 1);
+  });
+
+  it('holds checkout pending and approves exactly one payment by provider reference', async () => {
+    const created = await bookingModule.confirmBooking({ actor: { id: fixture.userIds[0] },
+      request: fixture.request, idempotencyKey: 'integration-pending-payment' });
+    assert.equal(created.booking.status, 'PENDIENTE_PAGO');
+    assert.equal(created.checkout.depositPercentage, 30);
+    assert.equal(created.checkout.amountDueMinor, created.checkout.depositAmountMinor);
+
+    const approved = await adapter.approveTestPayment({ bookingId: created.booking.id,
+      providerReference: 'test-payment-reference-1', amountMinor: created.checkout.amountDueMinor });
+    assert.equal(approved.booking.status, 'CONFIRMADA');
+    assert.equal(approved.booking.paymentStatus, 'PAGADO');
+    const replay = await adapter.approveTestPayment({ bookingId: created.booking.id,
+      providerReference: 'test-payment-reference-1', amountMinor: created.checkout.amountDueMinor });
+    assert.equal(replay.replayed, true);
+    const [payments] = await pool.execute('SELECT provider, purpose, status, user_id FROM payments WHERE booking_id = ?',
+      [created.booking.id]);
+    assert.deepEqual({ provider: payments[0].provider, purpose: payments[0].purpose,
+      status: payments[0].status, userId: String(payments[0].user_id) },
+    { provider: 'TEST', purpose: 'DEPOSITO', status: 'APROBADO', userId: fixture.userIds[0] });
+  });
+
+  it('expires a hold without recording a customer cancellation and releases its slot', async () => {
+    const first = await bookingModule.confirmBooking({ actor: { id: fixture.userIds[0] }, request: fixture.request,
+      idempotencyKey: 'expired-hold' });
+    await pool.execute('UPDATE bookings SET payment_expires_at = UTC_TIMESTAMP(6) - INTERVAL 1 SECOND WHERE id = ?',
+      [first.booking.id]);
+    const replacement = await bookingModule.confirmBooking({ actor: { id: fixture.userIds[1] }, request: fixture.request,
+      idempotencyKey: 'replacement-after-expiry' });
+    assert.equal(replacement.booking.status, 'PENDIENTE_PAGO');
+    const [expired] = await pool.execute(
+      'SELECT status, payment_status, cancelled_at, cancelled_by_user_id FROM bookings WHERE id = ?', [first.booking.id],
+    );
+    assert.deepEqual({ status: expired[0].status, paymentStatus: expired[0].payment_status,
+      cancelledAt: expired[0].cancelled_at, cancelledBy: expired[0].cancelled_by_user_id },
+    { status: 'PENDIENTE_PAGO', paymentStatus: 'EXPIRED', cancelledAt: null, cancelledBy: null });
+  });
+
+  it('returns a caller facility credit balance or zero without exposing another customer', async () => {
+    const now = toMySqlDateTime(new Date());
+    await pool.execute(
+      `INSERT INTO customer_credit_balances (facility_id, user_id, balance_minor, updated_at)
+       VALUES (?, ?, 4500, ?)`, [fixture.facilityId, fixture.userIds[0], now],
+    );
+    assert.deepEqual(await bookingModule.getFacilityCredit({ actor: { id: fixture.userIds[0] },
+      facilityId: fixture.facilityId }), { facilityId: fixture.facilityId, balanceMinor: 4500, currency: 'COP' });
+    assert.deepEqual(await bookingModule.getFacilityCredit({ actor: { id: fixture.userIds[1] },
+      facilityId: fixture.facilityId }), { facilityId: fixture.facilityId, balanceMinor: 0, currency: 'COP' });
+    await assert.rejects(bookingModule.getFacilityCredit({ actor: { id: fixture.userIds[0] }, facilityId: '999999999' }),
+      { code: 'resource_not_found' });
   });
 
   it('serializes incompatible confirmations so exactly one succeeds', async () => {
@@ -336,6 +395,9 @@ describe('booking MySQL integration', { skip: !MYSQL_AVAILABLE, timeout: 30_000 
     const actor = { id: fixture.userIds[0], email: fixture.userEmails[0] };
     const bookingRequest = { ...fixture.request, expectedPriceMinor: 5000000 };
     const first = await withEmail.confirmBooking({ actor, request: bookingRequest, idempotencyKey: 'email-replay' });
+    assert.equal(sent.length, 0);
+    await withEmail.approveTestPayment({ bookingId: first.booking.id, providerReference: 'email-replay-payment',
+      amountMinor: first.checkout.amountDueMinor });
     assert.equal(first.replayed, false);
     assert.equal(sent.length, 3);
     assert.deepEqual(sent.filter(({ type }) => type === 'booking-confirmation').map(({ email }) => email), [actor.email]);
@@ -386,10 +448,13 @@ describe('booking MySQL integration', { skip: !MYSQL_AVAILABLE, timeout: 30_000 
       .set('X-User-Id', fixture.userIds[0]).set('Idempotency-Key', 'email-provider-fails')
       .send(fixture.request).expect(201);
     const bookingId = confirmed.body.booking.id;
+    await withEmail.approveTestPayment({ bookingId, providerReference: 'provider-failure-payment',
+      amountMinor: confirmed.body.checkout.amountDueMinor });
     const [before] = await pool.execute('SELECT status FROM bookings WHERE id = ?', [bookingId]);
     assert.equal(before[0].status, 'CONFIRMADA');
     const cancelled = await request(app).post(`/api/v1/bookings/${bookingId}/cancellation`)
-      .set('X-User-Id', fixture.userIds[0]).expect(200);
+      .set('X-User-Id', fixture.userIds[0])
+      .set('X-Booking-Start-At', confirmed.body.booking.startAt).expect(200);
     assert.equal(cancelled.body.booking.status, 'CANCELADA');
     const [after] = await pool.execute('SELECT status FROM bookings WHERE id = ?', [bookingId]);
     assert.equal(after[0].status, 'CANCELADA');
@@ -400,6 +465,201 @@ describe('booking MySQL integration', { skip: !MYSQL_AVAILABLE, timeout: 30_000 
       'owner_booking_email_failed', 'owner_booking_email_failed',
     ]);
     assert.equal(errors.join(' ').includes('Sensitive provider failure'), false);
+  });
+
+  it('reschedules one booking atomically with current price, durable history and an approved late exception', async () => {
+    const sent = [];
+    const withEmail = createBookingModule({ adapter, clock: createSystemClock(),
+      notifications: createBookingEmailNotifier({
+        frontendOrigin: 'https://canchapp.online', sendEmail: async (message) => { sent.push(message); },
+      }) });
+    const actor = { id: fixture.userIds[0], email: fixture.userEmails[0] };
+    const created = await confirmPaid(withEmail, actor, fixture.request, 'resched-created');
+    const id = created.booking.id;
+    const original = created.booking;
+    await assert.rejects(withEmail.rescheduleBooking({ actor, bookingId: id, idempotencyKey: 'occupied',
+      request: { localDate: fixture.request.localDate, startTime: '12:00:00',
+        expectedPriceMinor: 9000000, currency: 'COP' } }), { code: 'invalid_booking_option' });
+    await pool.execute('UPDATE court_prices SET price_amount_minor = 6000000 WHERE court_id = ?', [fixture.courtId]);
+    await assert.rejects(withEmail.rescheduleBooking({ actor, bookingId: id, idempotencyKey: 'price-changed',
+      request: { localDate: fixture.request.localDate, startTime: '13:00:00',
+        expectedPriceMinor: 9000000, currency: 'COP' } }), { code: 'booking_price_changed' });
+    const [unchanged] = await pool.execute('SELECT start_at, price_amount_minor FROM bookings WHERE id = ?', [id]);
+    assert.equal(Number(unchanged[0].price_amount_minor), original.priceMinor);
+    const input = { localDate: fixture.request.localDate, startTime: '13:00:00',
+      expectedPriceMinor: 6000000, currency: 'COP' };
+    const moved = await withEmail.rescheduleBooking({ actor, bookingId: id, request: input, idempotencyKey: 'moved' });
+    assert.equal(moved.booking.id, id);
+    assert.equal(moved.booking.priceMinor, 6000000);
+    assert.notEqual(moved.booking.startAt, original.startAt);
+    assert.equal((await withEmail.rescheduleBooking({ actor, bookingId: id, request: input,
+      idempotencyKey: 'moved' })).replayed, true);
+    await assert.rejects(withEmail.rescheduleBooking({ actor, bookingId: id, request: {
+      ...input, startTime: '14:00:00' }, idempotencyKey: 'second-voluntary' }),
+    { code: 'voluntary_reschedule_limit_reached' });
+    const [financial] = await pool.execute(
+      'SELECT amount_paid_minor, deposit_amount_minor, voluntary_reschedule_count FROM bookings WHERE id = ?', [id],
+    );
+    assert.deepEqual({ paid: Number(financial[0].amount_paid_minor), deposit: Number(financial[0].deposit_amount_minor),
+      count: Number(financial[0].voluntary_reschedule_count) }, { paid: 2700000, deposit: 1800000, count: 1 });
+    const [credit] = await pool.execute(
+      "SELECT amount_minor FROM customer_credit_ledger WHERE booking_id = ? AND reason = 'RESCHEDULE_SURPLUS'", [id],
+    );
+    assert.equal(Number(credit[0].amount_minor), 900000);
+    const changes = await withEmail.listBookingChanges({ actor, bookingId: id });
+    assert.deepEqual(changes.items.map((change) => change.type), ['CREATED', 'RESCHEDULED']);
+    assert.equal(changes.items[1].previousPriceMinor, 9000000);
+    assert.equal(changes.items[1].newPriceMinor, 6000000);
+    assert.equal(changes.items[1].previousStartAt, original.startAt);
+    assert.equal(changes.items[1].newStartAt, moved.booking.startAt);
+    assert.equal(sent.filter((message) => message.type === 'booking-reschedule').length, 1);
+    assert.equal(sent.filter((message) => message.type === 'owner-booking-reschedule').length, 2);
+
+    await pool.execute('UPDATE bookings SET cancellation_min_minutes = 5000 WHERE id = ?', [id]);
+    await assert.rejects(withEmail.rescheduleBooking({ actor, bookingId: id, request: {
+      ...input, startTime: '12:00:00' }, idempotencyKey: 'window-closed' }),
+    { code: 'booking_cancellation_window_closed' });
+    const requested = await withEmail.requestBookingException({ actor, bookingId: id, category: 'MAL_CLIMA', note: 'Lluvia' });
+    await assert.rejects(withEmail.decideBookingException({ actor: { id: fixture.ownerIds[2], roles: ['PROPIETARIO'],
+      ownerScope: true }, exceptionId: requested.exception.id, decision: 'APROBADA' }), { code: 'resource_not_found' });
+    const owner = { id: fixture.ownerIds[0], roles: ['PROPIETARIO'], ownerScope: true };
+    await withEmail.decideBookingException({ actor: owner, exceptionId: requested.exception.id, decision: 'APROBADA' });
+    const late = await withEmail.rescheduleBooking({ actor, bookingId: id, request: {
+      ...input, startTime: '12:00:00' }, idempotencyKey: 'approved-late' });
+    assert.equal(late.booking.id, id);
+    assert.equal((await withEmail.listBookingChanges({ actor, bookingId: id })).items[2].economicOutcome,
+      'RESCHEDULE_PRIORITY');
+    await assert.rejects(withEmail.rescheduleBooking({ actor, bookingId: id, request: input,
+      idempotencyKey: 'already-used' }), { code: 'booking_cancellation_window_closed' });
+    const cancelled = await withEmail.cancelOwnerBooking({ actor: owner, bookingId: id,
+      reasonCode: 'COURT_DAMAGE', reason: 'Daño urgente de cancha' });
+    assert.equal(cancelled.booking.cancellationReason, 'CANCELLED_BY_OWNER');
+    assert.equal(cancelled.booking.economicOutcome, 'FULL_REFUND_OR_RESCHEDULE');
+    assert.equal((await withEmail.listBookingChanges({ actor, bookingId: id })).items[3].reason, 'Daño urgente de cancha');
+    assert.equal(sent.filter((message) => message.type === 'booking-owner-cancellation').length, 1);
+  });
+
+  it('snapshots the court cancellation policy and restricts no-show to an active member after start', async () => {
+    const owner = { id: fixture.ownerIds[0], roles: ['PROPIETARIO'], ownerScope: true };
+    await bookingModule.updateCancellationPolicy({ actor: owner, courtId: fixture.courtId,
+      cancellationMinMinutes: 240 });
+    const actor = { id: fixture.userIds[0], email: fixture.userEmails[0] };
+    const created = await confirmPaid(bookingModule, actor, fixture.request, 'policy-snapshot');
+    assert.equal(created.booking.cancellationMinMinutes, 240);
+    await bookingModule.updateCancellationPolicy({ actor: owner, courtId: fixture.courtId,
+      cancellationMinMinutes: 60 });
+    const [stored] = await pool.execute('SELECT cancellation_min_minutes FROM bookings WHERE id = ?', [created.booking.id]);
+    assert.equal(Number(stored[0].cancellation_min_minutes), 240);
+    await assert.rejects(bookingModule.markNoShow({ actor: owner, bookingId: created.booking.id }),
+      { code: 'booking_not_started' });
+    await pool.execute(`UPDATE bookings SET start_at = UTC_TIMESTAMP(6) - INTERVAL 1 MINUTE,
+      end_at = UTC_TIMESTAMP(6) + INTERVAL 59 MINUTE WHERE id = ?`, [created.booking.id]);
+    await assert.rejects(bookingModule.markNoShow({ actor: { ...owner, id: fixture.ownerIds[2] },
+      bookingId: created.booking.id }), { code: 'resource_not_found' });
+    const result = await bookingModule.markNoShow({ actor: owner, bookingId: created.booking.id });
+    assert.equal(result.booking.economicOutcome, 'NON_REFUNDABLE');
+    await bookingModule.markNoShow({ actor: owner, bookingId: created.booking.id });
+    assert.deepEqual((await bookingModule.listBookingChanges({ actor, bookingId: created.booking.id })).items
+      .map((change) => change.type), ['CREATED', 'NO_SHOW']);
+  });
+
+  it('serializes competing reschedules and keeps the losing original interval intact', async () => {
+    const actors = fixture.userIds.map((id) => ({ id }));
+    const first = await confirmPaid(bookingModule, actors[0], fixture.request, 'race-first');
+    const second = await confirmPaid(bookingModule, actors[1], {
+      ...fixture.request, startTime: '13:00:00' }, 'race-second');
+    const input = { localDate: fixture.request.localDate, startTime: '11:00:00',
+      expectedPriceMinor: 9000000, currency: 'COP' };
+    const held = await holdCourtLock(pool, fixture.courtId);
+    let results;
+    try {
+      const attempts = [first, second].map((item, index) => bookingModule.rescheduleBooking({
+        actor: actors[index], bookingId: item.booking.id, request: input, idempotencyKey: `race-move-${index}`,
+      }));
+      const completion = Promise.allSettled(attempts);
+      await held.release();
+      results = await completion;
+    } finally { await held.dispose(); }
+    assert.equal(results.filter((item) => item.status === 'fulfilled').length, 1);
+    assert.equal(results.find((item) => item.status === 'rejected').reason.code, 'booking_conflict');
+    const rows = await Promise.all([first.booking.id, second.booking.id].map(async (id) => {
+      const [values] = await pool.execute('SELECT start_at FROM bookings WHERE id = ?', [id]);
+      return toInstantString(values[0].start_at);
+    }));
+    assert.equal(rows.filter((value) => value === results.find((item) => item.status === 'fulfilled').value.booking.startAt).length, 1);
+    assert.equal(new Set(rows).size, 2);
+  });
+
+  it('a stale cancellation cannot cancel a concurrently rescheduled interval', async () => {
+    const actor = { id: fixture.userIds[0] };
+    const original = await confirmPaid(bookingModule, actor, fixture.request, 'cancel-race-original');
+    const moved = await bookingModule.rescheduleBooking({ actor, bookingId: original.booking.id,
+      idempotencyKey: 'cancel-race-move', request: { localDate: fixture.request.localDate,
+        startTime: '13:00:00', expectedPriceMinor: 9000000, currency: 'COP' } });
+    await assert.rejects(bookingModule.cancelBooking({ actor, bookingId: original.booking.id,
+      expectedStartAt: original.booking.startAt }), { code: 'booking_conflict' });
+    assert.equal(moved.booking.status, 'CONFIRMADA');
+    assert.deepEqual((await bookingModule.listBookingChanges({ actor, bookingId: original.booking.id })).items
+      .map((item) => item.type), ['CREATED', 'RESCHEDULED']);
+  });
+
+  it('requires a resolved approved exception for late cancellation and records a refund classification', async () => {
+    const actor = { id: fixture.userIds[0] };
+    const owner = { id: fixture.ownerIds[0], roles: ['PROPIETARIO'], ownerScope: true };
+    const created = await confirmPaid(bookingModule, actor, fixture.request, 'exception-cancel-created');
+    const bookingId = created.booking.id;
+    await pool.execute('UPDATE bookings SET cancellation_min_minutes = 5000 WHERE id = ?', [bookingId]);
+    await assert.rejects(bookingModule.cancelBooking({ actor, bookingId }),
+      { code: 'booking_cancellation_window_closed' });
+    await assert.rejects(bookingModule.cancelExceptionBooking({ actor, bookingId }),
+      { code: 'booking_cancellation_window_closed' });
+    const first = await bookingModule.requestBookingException({ actor, bookingId, category: 'FUERZA_MAYOR' });
+    await bookingModule.decideBookingException({ actor: owner, exceptionId: first.exception.id,
+      decision: 'RECHAZADA' });
+    await assert.rejects(bookingModule.cancelExceptionBooking({ actor, bookingId }),
+      { code: 'booking_cancellation_window_closed' });
+    const second = await bookingModule.requestBookingException({ actor, bookingId, category: 'MAL_CLIMA' });
+    await bookingModule.decideBookingException({ actor: owner, exceptionId: second.exception.id,
+      decision: 'APROBADA' });
+    const cancelled = await bookingModule.cancelExceptionBooking({ actor, bookingId });
+    assert.equal(cancelled.booking.cancellationReason, 'CLIENTE_EXCEPCION');
+    assert.equal(cancelled.booking.economicOutcome, 'REFUND_ALLOWED');
+    const [rows] = await pool.execute('SELECT used_at, economic_outcome FROM booking_exception_requests WHERE id = ?',
+      [second.exception.id]);
+    assert.ok(rows[0].used_at);
+    assert.equal(rows[0].economic_outcome, 'REFUND_ALLOWED');
+    assert.deepEqual((await bookingModule.listBookingChanges({ actor, bookingId })).items.map((item) => item.type),
+      ['CREATED', 'CANCELLED_BY_CUSTOMER']);
+  });
+
+  it('rejects reschedules blocked by another booking, closing hours, an outage or a date exception', async () => {
+    const actor = { id: fixture.userIds[0] };
+    const original = await confirmPaid(bookingModule, actor, fixture.request, 'unavailable-original');
+    await confirmPaid(bookingModule, { id: fixture.userIds[1] },
+      { ...fixture.request, startTime: '13:00:00' }, 'unavailable-neighbor');
+    async function move(startTime, key, code) {
+      await assert.rejects(bookingModule.rescheduleBooking({ actor, bookingId: original.booking.id,
+        request: { localDate: fixture.request.localDate, startTime,
+          expectedPriceMinor: 9000000, currency: 'COP' }, idempotencyKey: key }), { code });
+    }
+    await move('13:00:00', 'neighbor-blocks', 'booking_conflict');
+    await move('15:00:00', 'outside-schedule', 'invalid_booking_option');
+    const unavailableStart = new Date(`${fixture.request.localDate}T16:00:00Z`);
+    const unavailableEnd = new Date(`${fixture.request.localDate}T17:00:00Z`);
+    await pool.execute(
+      `INSERT INTO court_unavailabilities (court_id, type, start_at, end_at, created_by_user_id, created_at)
+       VALUES (?, 'FUERA_DE_SERVICIO', ?, ?, ?, UTC_TIMESTAMP(6))`,
+      [fixture.courtId, toMySqlDateTime(unavailableStart), toMySqlDateTime(unavailableEnd), fixture.userIds[0]],
+    );
+    await move('11:00:00', 'blocked-outage', 'option_not_available');
+    await pool.execute('DELETE FROM court_unavailabilities WHERE court_id = ?', [fixture.courtId]);
+    await pool.execute(`INSERT INTO court_date_exceptions (court_id, local_date, mode)
+      VALUES (?, ?, 'CLOSED')`, [fixture.courtId, fixture.request.localDate]);
+    await move('11:00:00', 'closed-date', 'invalid_booking_option');
+    const [unchanged] = await pool.execute('SELECT start_at FROM bookings WHERE id = ?', [original.booking.id]);
+    assert.equal(toInstantString(unchanged[0].start_at), original.booking.startAt);
+    assert.deepEqual((await bookingModule.listBookingChanges({ actor, bookingId: original.booking.id })).items
+      .map((item) => item.type), ['CREATED']);
   });
 });
 
@@ -507,7 +767,22 @@ async function cleanFixture(pool, fixture) {
       `DELETE FROM idempotency_records WHERE user_id IN (?, ?)`,
       fixture.userIds,
     );
+    await connection.execute('DELETE FROM booking_changes WHERE booking_id IN (SELECT id FROM bookings WHERE court_id = ?)',
+      [fixture.courtId]);
+    await connection.execute('DELETE FROM booking_exception_requests WHERE booking_id IN (SELECT id FROM bookings WHERE court_id = ?)',
+      [fixture.courtId]);
+    await connection.execute('DELETE FROM payments WHERE booking_id IN (SELECT id FROM bookings WHERE court_id = ?)',
+      [fixture.courtId]);
+    await connection.execute('DELETE FROM customer_credit_ledger WHERE booking_id IN (SELECT id FROM bookings WHERE court_id = ?)',
+      [fixture.courtId]);
     await connection.execute('DELETE FROM bookings WHERE court_id = ?', [fixture.courtId]);
+    await connection.execute('DELETE FROM customer_credit_ledger WHERE facility_id = ? AND user_id IN (?, ?)',
+      [fixture.facilityId, ...fixture.userIds]);
+    await connection.execute('DELETE FROM customer_credit_balances WHERE facility_id = ? AND user_id IN (?, ?)',
+      [fixture.facilityId, ...fixture.userIds]);
+    await connection.execute('DELETE FROM court_unavailabilities WHERE court_id = ?', [fixture.courtId]);
+    await connection.execute('DELETE FROM court_exception_periods WHERE exception_id IN (SELECT id FROM court_date_exceptions WHERE court_id = ?)', [fixture.courtId]);
+    await connection.execute('DELETE FROM court_date_exceptions WHERE court_id = ?', [fixture.courtId]);
     await connection.execute(
       'DELETE FROM court_weekly_periods WHERE court_id = ?',
       [fixture.courtId],
