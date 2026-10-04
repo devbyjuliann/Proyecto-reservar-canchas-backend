@@ -15,8 +15,8 @@ export function createPaymentsRouter({ booking, wompi, requireIdentity }) {
     const amountInCents = wompiAmountInCentsFromMinor(attempt.amountMinor);
     const expirationTime = attempt.expiresAt;
     response.status(201).json({ config: { publicKey: wompi.config.publicKey, currency: 'COP', amountInCents,
-      reference, integrity: checkoutIntegrity({ reference, amountInCents, expirationTime,
-        integritySecret: wompi.config.integritySecret }), expirationTime, redirectUrl: wompi.redirectUrl } });
+      reference, signature: { integrity: checkoutIntegrity({ reference, amountInCents, expirationTime,
+        integritySecret: wompi.config.integritySecret }) }, expirationTime, redirectUrl: wompi.redirectUrl } });
   });
   router.post('/api/v1/bookings/:bookingId/payments/wompi/reconcile', requireIdentity, async (request, response) => {
     if (request.body && (Object.keys(request.body).join(',') !== 'transactionId' || typeof request.body.transactionId !== 'string'

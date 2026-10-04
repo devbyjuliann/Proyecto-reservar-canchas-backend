@@ -58,7 +58,7 @@ describe('Wompi HTTP contract', () => {
     const { reference } = response.body.config;
     const expected = {
       publicKey: 'pub_test_public', currency: 'COP', amountInCents: 2700000, reference,
-      integrity: checkoutIntegrity({ reference, amountInCents: 2700000, expirationTime: '2026-09-24T15:00:00.000Z', integritySecret: 'integrity_secret' }),
+      signature: { integrity: checkoutIntegrity({ reference, amountInCents: 2700000, expirationTime: '2026-09-24T15:00:00.000Z', integritySecret: 'integrity_secret' }) },
       expirationTime: '2026-09-24T15:00:00.000Z', redirectUrl: 'http://localhost:5173/reservas/pago',
     };
     assert.match(reference, /^RC-BKG-901-[a-f0-9]{24}$/);
