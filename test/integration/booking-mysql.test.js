@@ -23,6 +23,7 @@ import {
   createMySqlBookingAdapter,
 } from '../../src/modules/booking/index.js';
 import { createSystemClock } from '../../src/shared/clock.js';
+import { createRefundEngine } from '../../src/modules/payments/refunds.js';
 import { toInstantString, toMySqlDateTime } from '../../src/shared/time.js';
 
 const REQUIRED_DB_ENV = ['DB_HOST', 'DB_PORT', 'DB_USER', 'DB_PASSWORD', 'DB_NAME'];
@@ -128,6 +129,165 @@ describe('booking MySQL integration', { skip: !MYSQL_AVAILABLE, timeout: 30_000 
     assert.deepEqual({ provider: payments[0].provider, purpose: payments[0].purpose,
       status: payments[0].status, userId: String(payments[0].user_id) },
     { provider: 'TEST', purpose: 'DEPOSITO', status: 'APROBADO', userId: fixture.userIds[0] });
+  });
+
+  it('refunds only captured Wompi money and restores consumed facility credit once', async () => {
+    const customer = fixture.userIds[0];
+    await pool.execute(`INSERT INTO customer_credit_balances (facility_id, user_id, balance_minor, updated_at)
+      VALUES (?, ?, 500000, UTC_TIMESTAMP(6))`, [fixture.facilityId, customer]);
+    const created = await bookingModule.confirmBooking({ actor: { id: customer },
+      request: { ...fixture.request, useCreditMinor: 500000 }, idempotencyKey: `credit-refund-${randomUUID()}` });
+    assert.equal(created.checkout.creditAppliedMinor, 500000);
+    const due = created.checkout.amountDueMinor;
+    await bookingModule.approveTestPayment({ bookingId: created.booking.id, providerReference: `test-${randomUUID()}`,
+      amountMinor: due });
+    await pool.execute(`UPDATE payments SET provider = 'WOMPI', wompi_transaction_id = ?, provider_status = 'APPROVED'
+      WHERE booking_id = ?`, [`tx-${randomUUID()}`, created.booking.id]);
+    const cancelled = await bookingModule.cancelOwnerBooking({ actor: { id: fixture.ownerIds[0], roles: ['PROPIETARIO'], ownerScope: true },
+      bookingId: created.booking.id, reason: 'Daño de cancha', reasonCode: 'COURT_DAMAGE' });
+    assert.equal(cancelled.booking.economicOutcome, 'FULL_REFUND_OR_RESCHEDULE');
+    let calls = 0;
+    const refunds = createRefundEngine({ pool, provider: { createRefund: async (input) => {
+      calls += 1; assert.equal(input.amountInCents, due);
+      return { id: 'refund-fixture-approved', status: 'APPROVED' };
+    } } });
+    await refunds.resolve({ bookingId: created.booking.id, userId: customer, choice: 'REFUND' });
+    await refunds.resolve({ bookingId: created.booking.id, userId: customer, choice: 'REFUND' });
+    const [refundRows] = await pool.execute('SELECT id, amount_minor FROM payment_refunds WHERE booking_id = ?',
+      [created.booking.id]);
+    assert.equal(refundRows.length, 1);
+    await refunds.recordProviderResult({ refundId: String(refundRows[0].id), id: 'forged',
+      transactionId: 'other-transaction', amountInCents: due + 1, currency: 'USD', status: 'APPROVED' });
+    const [stillPending] = await pool.execute('SELECT status FROM payment_refunds WHERE id = ?', [refundRows[0].id]);
+    assert.equal(stillPending[0].status, 'PENDING');
+    await Promise.all([refunds.processOne(String(refundRows[0].id)), refunds.processOne(String(refundRows[0].id))]);
+    assert.equal(calls, 1);
+    assert.equal(Number(refundRows[0].amount_minor), due);
+    const [ledger] = await pool.execute(`SELECT amount_minor FROM customer_credit_ledger WHERE booking_id = ?
+      AND reason = 'CREDIT_RESTORED'`, [created.booking.id]);
+    assert.deepEqual(ledger.map((row) => Number(row.amount_minor)), [500000]);
+    const [balance] = await pool.execute(`SELECT balance_minor FROM customer_credit_balances WHERE facility_id = ?
+      AND user_id = ?`, [fixture.facilityId, customer]);
+    assert.equal(Number(balance[0].balance_minor), 500000);
+    const [booking] = await pool.execute('SELECT status FROM bookings WHERE id = ?', [created.booking.id]);
+    assert.equal(booking[0].status, 'CANCELADA');
+  });
+
+  it('keeps an expired booking unconfirmed and automatically refunds a late Wompi approval', async () => {
+    const actor = { id: fixture.userIds[0] };
+    const created = await bookingModule.confirmBooking({ actor, request: fixture.request,
+      idempotencyKey: `late-refund-${randomUUID()}` });
+    const reference = `RC-BKG-${created.booking.id}-${randomUUID()}`;
+    await bookingModule.createPaymentAttempt({ actor, bookingId: created.booking.id, provider: 'WOMPI', reference });
+    await pool.execute('UPDATE bookings SET payment_expires_at = UTC_TIMESTAMP(6) - INTERVAL 1 SECOND WHERE id = ?',
+      [created.booking.id]);
+    const [rows] = await pool.execute('SELECT id FROM payments WHERE provider_reference = ?', [reference]);
+    let sent = 0;
+    let refunded = 0;
+    const refunds = createRefundEngine({ pool, provider: { createRefund: async (input) => {
+      refunded += 1; assert.equal(input.amountInCents, created.checkout.amountDueMinor);
+      return { id: 'late-refund-fixture', status: 'APPROVED' };
+    } }, notifications: { refundApproved: async () => { sent += 1; } } });
+    const withRefunds = createBookingModule({ adapter, clock: createSystemClock(), refunds,
+      notifications: { confirmation: () => { throw new Error('Late approval must never confirm'); } } });
+    const facts = { id: `tx-${randomUUID()}`, reference, amountInCents: created.checkout.amountDueMinor,
+      currency: 'COP', status: 'APPROVED', finalizedAt: new Date().toISOString() };
+    const settled = await withRefunds.settlePayment({ provider: 'WOMPI', facts });
+    assert.equal(settled.confirmed, false);
+    await withRefunds.settlePayment({ provider: 'WOMPI', facts });
+    const [booking] = await pool.execute('SELECT status FROM bookings WHERE id = ?', [created.booking.id]);
+    assert.equal(booking[0].status, 'PENDIENTE_PAGO');
+    const [payments] = await pool.execute('SELECT status FROM payments WHERE id = ?', [rows[0].id]);
+    assert.equal(payments[0].status, 'REFUND_PENDING');
+    const [refundRows] = await pool.execute('SELECT status FROM payment_refunds WHERE payment_id = ?', [rows[0].id]);
+    assert.deepEqual(refundRows.map((r) => r.status), ['APPROVED']);
+    assert.equal(refunded, 1);
+    assert.equal(sent, 1);
+  });
+
+  it('moves owner-cancelled money nominally without creating a refund or consuming voluntary change', async () => {
+    const actor = { id: fixture.userIds[0] };
+    const created = await confirmPaid(bookingModule, actor, fixture.request, `owner-move-${randomUUID()}`);
+    await bookingModule.cancelOwnerBooking({ actor: { id: fixture.ownerIds[0], roles: ['PROPIETARIO'], ownerScope: true },
+      bookingId: created.booking.id, reason: 'Cierre', reasonCode: 'UNEXPECTED_CLOSURE' });
+    const moved = await bookingModule.rescheduleBooking({ actor, bookingId: created.booking.id,
+      idempotencyKey: `owner-moved-${randomUUID()}`,
+      request: { localDate: fixture.request.localDate, startTime: '10:00:00',
+        expectedPriceMinor: 9000000, currency: 'COP' } });
+    assert.equal(moved.booking.status, 'CONFIRMADA');
+    assert.equal(moved.booking.economicResolution, 'RESCHEDULED');
+    assert.equal(moved.booking.voluntaryRescheduleCount, 0);
+    assert.equal(moved.booking.amountPaidMinor, created.booking.amountPaidMinor);
+    const [refunds] = await pool.execute('SELECT id FROM payment_refunds WHERE booking_id = ?', [created.booking.id]);
+    assert.equal(refunds.length, 0);
+  });
+
+  for (const status of ['DECLINED', 'ERROR', 'CANCELLED']) {
+    it(`retains a ${status} refund for resolution without restoring credit or retrying the POST`, async () => {
+      const actor = { id: fixture.userIds[0] };
+      const created = await bookingModule.confirmBooking({ actor, request: fixture.request,
+        idempotencyKey: `failed-refund-${randomUUID()}` });
+      await bookingModule.approveTestPayment({ bookingId: created.booking.id,
+        providerReference: `test-${randomUUID()}`, amountMinor: created.checkout.amountDueMinor });
+      await pool.execute(`UPDATE payments SET provider = 'WOMPI', wompi_transaction_id = ?,
+        provider_status = 'APPROVED' WHERE booking_id = ?`,
+        [`tx-${randomUUID()}`, created.booking.id]);
+      await bookingModule.cancelOwnerBooking({ actor: { id: fixture.ownerIds[0], roles: ['PROPIETARIO'], ownerScope: true },
+        bookingId: created.booking.id, reason: 'Daño', reasonCode: 'COURT_DAMAGE' });
+      let calls = 0;
+      const refunds = createRefundEngine({ pool, provider: { createRefund: async () => {
+        calls += 1; return { id: `refund-${randomUUID()}`, status };
+      } } });
+      await refunds.resolve({ bookingId: created.booking.id, userId: actor.id, choice: 'REFUND' });
+      await refunds.processPending();
+      await refunds.processPending();
+      const [rows] = await pool.execute('SELECT status FROM payment_refunds WHERE booking_id = ?', [created.booking.id]);
+      assert.deepEqual(rows.map((row) => row.status), [status]);
+      assert.equal(calls, 1);
+      await assert.rejects(refunds.resolve({ bookingId: created.booking.id, userId: fixture.userIds[1],
+        choice: 'REFUND' }), { code: 'forbidden' });
+      await assert.rejects(refunds.resolve({ bookingId: created.booking.id, userId: actor.id,
+        choice: 'RESCHEDULE' }), { code: 'invalid_booking_state' });
+    });
+  }
+
+  it('waits for a weather cancellation and explicit customer choice before requesting a refund', async () => {
+    const actor = { id: fixture.userIds[0] };
+    const created = await confirmPaid(bookingModule, actor, fixture.request, `weather-${randomUUID()}`);
+    await pool.execute(`UPDATE payments SET provider = 'WOMPI', wompi_transaction_id = ?,
+      provider_status = 'APPROVED' WHERE booking_id = ?`, [`tx-${randomUUID()}`, created.booking.id]);
+    const requested = await bookingModule.requestBookingException({ actor, bookingId: created.booking.id,
+      category: 'MAL_CLIMA', note: 'Llueve' });
+    await bookingModule.decideBookingException({ actor: { id: fixture.ownerIds[0], roles: ['PROPIETARIO'],
+      ownerScope: true }, exceptionId: requested.exception.id, decision: 'APROBADA' });
+    const [before] = await pool.execute('SELECT id FROM payment_refunds WHERE booking_id = ?', [created.booking.id]);
+    assert.equal(before.length, 0);
+    await bookingModule.cancelExceptionBooking({ actor, bookingId: created.booking.id });
+    const refunds = createRefundEngine({ pool, provider: { createRefund: async () => ({ id: 'weather-refund',
+      status: 'APPROVED' }) } });
+    await refunds.resolve({ bookingId: created.booking.id, userId: actor.id, choice: 'REFUND' });
+    await refunds.processPending();
+    const [rows] = await pool.execute('SELECT status, reason_code FROM payment_refunds WHERE booking_id = ?',
+      [created.booking.id]);
+    assert.deepEqual(rows.map(({ status, reason_code: reason }) => ({ status, reason })),
+      [{ status: 'APPROVED', reason: 'WEATHER_EXCEPTION' }]);
+  });
+
+  it('never creates a Wompi refund from voluntary cancellation', async () => {
+    const actor = { id: fixture.userIds[0] };
+    const created = await confirmPaid(bookingModule, actor, fixture.request, `voluntary-${randomUUID()}`);
+    await pool.execute(`UPDATE payments SET provider = 'WOMPI', wompi_transaction_id = ?,
+      provider_status = 'APPROVED' WHERE booking_id = ?`, [`tx-${randomUUID()}`, created.booking.id]);
+    const cancelled = await bookingModule.cancelBooking({ actor, bookingId: created.booking.id });
+    assert.equal(cancelled.booking.economicOutcome, 'NON_REFUNDABLE');
+    const refunds = createRefundEngine({ pool, provider: { createRefund: () => {
+      throw new Error('Voluntary cancellation cannot refund');
+    } } });
+    await assert.rejects(refunds.resolve({ bookingId: created.booking.id, userId: actor.id,
+      choice: 'REFUND' }), { code: 'invalid_booking_state' });
+    await refunds.processPending();
+    const [rows] = await pool.execute('SELECT id FROM payment_refunds WHERE booking_id = ?', [created.booking.id]);
+    assert.equal(rows.length, 0);
   });
 
   it('expires a hold without recording a customer cancellation and releases its slot', async () => {
@@ -770,6 +930,8 @@ async function cleanFixture(pool, fixture) {
     await connection.execute('DELETE FROM booking_changes WHERE booking_id IN (SELECT id FROM bookings WHERE court_id = ?)',
       [fixture.courtId]);
     await connection.execute('DELETE FROM booking_exception_requests WHERE booking_id IN (SELECT id FROM bookings WHERE court_id = ?)',
+       [fixture.courtId]);
+    await connection.execute('DELETE FROM payment_refunds WHERE booking_id IN (SELECT id FROM bookings WHERE court_id = ?)',
       [fixture.courtId]);
     await connection.execute('DELETE FROM payments WHERE booking_id IN (SELECT id FROM bookings WHERE court_id = ?)',
       [fixture.courtId]);

@@ -77,6 +77,18 @@ function createFixture({ environment = 'test', bookingOverrides = {} } = {}) {
 }
 
 describe('booking HTTP contract', () => {
+  it('accepts only a customer resolution choice, never a client-provided refund amount', async () => {
+    const calls = [];
+    const app = createFixture({ bookingOverrides: { async resolveBooking(input) {
+      calls.push(input); return { resolution: input.choice, bookingId: input.bookingId };
+    } } });
+    await request(app).post('/api/v1/bookings/901/resolution').set('X-User-Id', '7')
+      .send({ choice: 'REFUND', refundAmount: 9000000 }).expect(400);
+    await request(app).post('/api/v1/bookings/901/resolution').send({ choice: 'REFUND' }).expect(401);
+    await request(app).post('/api/v1/bookings/901/resolution').set('X-User-Id', '7')
+      .send({ choice: 'REFUND' }).expect(200);
+    assert.deepEqual(calls, [{ actor: { id: '7', roles: ['USUARIO'] }, bookingId: '901', choice: 'REFUND' }]);
+  });
   it('validates rescheduling and exceptions and forwards the stale-cancellation guard', async () => {
     let reschedule;
     let expectedStartAt;

@@ -20,6 +20,7 @@ import { createOwnerDirectoryModule, createMySqlOwnerDirectoryAdapter } from './
 import { createSystemClock } from './shared/clock.js';
 import { createEmailTransport } from './shared/email-transport.js';
 import { createWompiProvider } from './modules/payments/index.js';
+import { createRefundEngine } from './modules/payments/refunds.js';
 
 export async function startServer() {
   const config = loadAppConfig();
@@ -30,6 +31,10 @@ export async function startServer() {
   const catalogAdapter = createMySqlPublicCatalogAdapter({ pool });
   const bookingAdapter = createMySqlBookingAdapter({ pool, isPublicCourt: catalogAdapter.isPublicCourt });
   const clock = createSystemClock();
+  const wompiProvider = config.wompi.enabled ? createWompiProvider({ config: config.wompi }) : null;
+  const bookingNotifications = createBookingEmailNotifier({ sendEmail, frontendOrigin: config.frontendOrigin });
+  const refunds = wompiProvider ? createRefundEngine({ pool, provider: wompiProvider,
+    notifications: bookingNotifications }) : null;
   const auth = createAuthModule({
     adapter: createMySqlAuthAdapter({ pool }), clock, frontendOrigin: config.frontendOrigin,
     sendPasswordResetEmail,
@@ -39,7 +44,7 @@ export async function startServer() {
   const booking = createBookingModule({
     adapter: bookingAdapter,
     clock,
-    notifications: createBookingEmailNotifier({ sendEmail, frontendOrigin: config.frontendOrigin }),
+    notifications: bookingNotifications, refunds,
   });
   const facilities = createFacilitiesModule({ adapter: createMySqlFacilitiesAdapter({ pool }), clock });
   const ownerApplications = createOwnerApplicationsModule({
@@ -69,7 +74,7 @@ export async function startServer() {
     findActiveUserById: (userId) => usersAdapter.findById(userId),
     wompi: config.wompi.enabled ? {
       config: config.wompi,
-      provider: createWompiProvider({ config: config.wompi }),
+      provider: wompiProvider, refunds,
       redirectUrl: `${config.frontendOrigin}/reservas/pago`,
     } : undefined,
   });
@@ -77,11 +82,18 @@ export async function startServer() {
   const server = app.listen(config.port, config.host, () => {
     console.info(`Reserva Canchas listening on http://${config.host}:${config.port}`);
   });
+  const refundPoller = refunds && setInterval(async () => {
+    try { await refunds.processPending(); }
+    catch { console.error('Refund poll failed'); }
+  }, 60_000);
+  refundPoller?.unref();
+  if (refunds) refunds.processPending().catch(() => console.error('Refund startup poll failed'));
 
   let shuttingDown = false;
   async function shutdown() {
     if (shuttingDown) return;
     shuttingDown = true;
+    if (refundPoller) clearInterval(refundPoller);
     server.close(async () => {
       await pool.end();
       process.exitCode = 0;

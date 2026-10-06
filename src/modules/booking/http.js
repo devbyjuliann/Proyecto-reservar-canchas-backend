@@ -108,6 +108,13 @@ export function createBookingRouter({ booking, requireIdentity, catalog }) {
     response.json(await booking.cancelExceptionBooking({ actor: request.context.user, bookingId }));
   });
 
+  router.post('/api/v1/bookings/:bookingId/resolution', requireIdentity, async (request, response) => {
+    const { bookingId } = validateCancellationRequest({ bookingId: request.params.bookingId });
+    if (!request.body || Object.keys(request.body).join(',') !== 'choice'
+      || !['REFUND', 'RESCHEDULE'].includes(request.body.choice)) throw bookingError('invalid_request');
+    response.json(await booking.resolveBooking({ actor: request.context.user, bookingId, choice: request.body.choice }));
+  });
+
   return router;
 }
 

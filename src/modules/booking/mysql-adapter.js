@@ -330,7 +330,7 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
         toMySqlDateTime(now), payment.id]);
       if (late) {
         await connection.execute("UPDATE bookings SET payment_status = 'REFUND_PENDING' WHERE id = ?", [payment.booking_id]);
-        return { changed: true, confirmed: false, refundPending: true };
+        return { changed: true, confirmed: false, refundPending: true, paymentId: String(payment.id) };
       }
       if (facts.status !== 'APPROVED') return { changed: true, confirmed: false };
       if (bookings[0].status !== 'PENDIENTE_PAGO') return { changed: false, ignored: true };
@@ -386,7 +386,11 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
        `SELECT b.id, b.user_id, b.start_at, b.end_at, b.booking_timezone, b.status,
                 b.price_amount_minor, b.price_currency, b.no_show_at, b.payment_status,
                 b.deposit_percentage_snapshot, b.deposit_amount_minor, b.amount_paid_minor,
-                b.payment_expires_at, b.voluntary_reschedule_count,
+                 b.payment_expires_at, b.voluntary_reschedule_count, b.economic_outcome,
+                 b.economic_resolution, b.cancellation_reason,
+                 (SELECT CASE WHEN SUM(r.status = 'PENDING') > 0 THEN 'REFUND_PENDING'
+                   WHEN SUM(r.status = 'APPROVED') > 0 AND SUM(r.status IN ('ERROR', 'DECLINED', 'CANCELLED')) = 0 THEN 'REFUNDED'
+                   ELSE 'REFUND_PENDING' END FROM payment_refunds r WHERE r.booking_id = b.id) AS refund_state,
               c.id AS court_id, c.name AS court_name,
               f.id AS facility_id, f.name AS facility_name,
               customer.name AS customer_name
@@ -415,7 +419,11 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
        depositAmountMinor: row.deposit_amount_minor == null ? null : Number(row.deposit_amount_minor),
        amountPaidMinor: row.amount_paid_minor == null ? null : Number(row.amount_paid_minor),
        paymentExpiresAt: row.payment_expires_at == null ? null : toInstantString(row.payment_expires_at),
-       voluntaryRescheduleCount: row.voluntary_reschedule_count == null ? null : Number(row.voluntary_reschedule_count),
+        voluntaryRescheduleCount: row.voluntary_reschedule_count == null ? null : Number(row.voluntary_reschedule_count),
+        economicOutcome: row.economic_outcome,
+        economicResolution: row.economic_resolution,
+        refundState: row.refund_state,
+        cancellationReason: row.cancellation_reason,
     }));
   }
 
@@ -539,11 +547,12 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
       const previous = await loadBooking(connection, bookingId);
       const now = await readDatabaseNow(connection);
       if (previous.userId !== userId) throw bookingError('forbidden');
-      const [exceptions] = await connection.execute(
+       const [exceptions] = await connection.execute(
         `SELECT id FROM booking_exception_requests WHERE booking_id = ?
          AND status = 'APROBADA' AND used_at IS NULL ORDER BY id DESC LIMIT 1 FOR UPDATE`, [bookingId],
       );
-      const useException = decide({ booking: previous, now, exceptionApproved: exceptions.length > 0 });
+       const ownerCancelled = previous.status === 'CANCELADA' && previous.cancellationReason === 'CANCELLED_BY_OWNER';
+       const useException = decide({ booking: previous, now, exceptionApproved: exceptions.length > 0 });
       const durationMinutes = Temporal.Instant.from(previous.startAt).until(previous.endAt).total('minutes');
       const snapshot = await loadAvailabilityContext(connection, {
         courtId, date: request.localDate, lockCourt: false,
@@ -566,13 +575,16 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
       const nextDeposit = Math.ceil(currentPrice * previous.depositPercentage / 100);
       const surplus = Math.max(0, previous.amountPaidMinor - nextDeposit);
       await connection.execute(
-        `UPDATE bookings SET start_at = ?, end_at = ?, price_amount_minor = ?, price_currency = 'COP',
-           deposit_amount_minor = ?, payment_status = ?, voluntary_reschedule_count = voluntary_reschedule_count + ?
-         WHERE id = ? AND status = 'CONFIRMADA'`,
-        [toMySqlDateTime(decision.option.startAt), toMySqlDateTime(decision.option.endAt), currentPrice,
-          nextDeposit, previous.amountPaidMinor >= nextDeposit ? 'PAGADO' : 'PENDIENTE',
-          useException ? 0 : 1, bookingId],
-      );
+         `UPDATE bookings SET start_at = ?, end_at = ?, price_amount_minor = ?, price_currency = 'COP',
+            deposit_amount_minor = ?, payment_status = ?, voluntary_reschedule_count = voluntary_reschedule_count + ?,
+            status = 'CONFIRMADA', cancelled_at = NULL, cancelled_by_user_id = NULL,
+            cancellation_reason = NULL, economic_resolution = ?, economic_outcome = ?
+          WHERE id = ? AND status IN ('CONFIRMADA', 'CANCELADA')`,
+         [toMySqlDateTime(decision.option.startAt), toMySqlDateTime(decision.option.endAt), currentPrice,
+           nextDeposit, previous.amountPaidMinor >= nextDeposit ? 'PAGADO' : 'PENDIENTE',
+           useException ? 0 : 1, ownerCancelled ? 'RESCHEDULED' : null,
+           useException ? 'RESCHEDULE_PRIORITY' : 'NOT_APPLICABLE', bookingId],
+       );
       const [credited] = await connection.execute(
         `SELECT COALESCE(SUM(amount_minor), 0) AS amount FROM customer_credit_ledger
          WHERE booking_id = ? AND reason = 'RESCHEDULE_SURPLUS' FOR UPDATE`, [bookingId],
@@ -580,7 +592,7 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
       const additionalCredit = Math.max(0, surplus - Number(credited[0].amount));
       if (additionalCredit > 0) await grantCredit(connection, { facilityId: previous.facility.id,
         userId, bookingId, amountMinor: additionalCredit, now });
-      if (useException) await connection.execute(
+       if (exceptions.length && useException) await connection.execute(
         'UPDATE booking_exception_requests SET used_at = ? WHERE id = ? AND used_at IS NULL',
         [toMySqlDateTime(now), exceptions[0].id],
       );
@@ -2118,10 +2130,13 @@ function bookingSelect() {
                   b.status, b.created_at, b.cancelled_at, b.price_amount_minor, b.price_currency,
                    b.cancellation_min_minutes, b.cancellation_reason, b.economic_outcome, b.no_show_at,
                    b.deposit_percentage_snapshot, b.deposit_amount_minor, b.amount_paid_minor,
-                    b.payment_status, b.payment_expires_at, b.voluntary_reschedule_count,
+                     b.payment_status, b.payment_expires_at, b.voluntary_reschedule_count, b.economic_resolution,
                   EXISTS (SELECT 1 FROM booking_exception_requests AS e
                     WHERE e.booking_id = b.id AND e.status = 'APROBADA' AND e.used_at IS NULL) AS exception_approved,
-                  c.id AS court_id, c.name AS court_name,
+                   (SELECT CASE WHEN SUM(r.status = 'PENDING') > 0 THEN 'REFUND_PENDING'
+                     WHEN SUM(r.status = 'APPROVED') > 0 AND SUM(r.status IN ('ERROR', 'DECLINED', 'CANCELLED')) = 0 THEN 'REFUNDED'
+                     ELSE 'REFUND_PENDING' END FROM payment_refunds r WHERE r.booking_id = b.id) AS refund_state,
+                   c.id AS court_id, c.name AS court_name,
                   f.id AS facility_id, f.name AS facility_name,
                   customer.name AS customer_name, customer.email AS customer_email
            FROM bookings AS b
@@ -2154,6 +2169,8 @@ function mapBooking(row) {
     paymentExpiresAt: row.payment_expires_at == null ? null : toInstantString(row.payment_expires_at),
     voluntaryRescheduleCount: row.voluntary_reschedule_count == null ? null : Number(row.voluntary_reschedule_count),
     exceptionApproved: Boolean(row.exception_approved),
+    economicResolution: row.economic_resolution,
+    refundState: row.refund_state ?? (row.economic_resolution === 'REFUND_REQUESTED' ? 'REFUNDED' : null),
     status: row.status,
     createdAt: toInstantString(row.created_at),
     cancelledAt: row.cancelled_at == null ? null : toInstantString(row.cancelled_at),

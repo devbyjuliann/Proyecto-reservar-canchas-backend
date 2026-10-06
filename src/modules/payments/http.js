@@ -41,7 +41,21 @@ export function createWompiWebhookRouter({ booking, wompi }) {
     if (!verifyWebhookSignature({ event, eventsSecret: wompi.config.eventsSecret, headerSignature: header })) {
       response.status(401).json({ error: { code: 'invalid_signature', message: 'Invalid signature' } }); return;
     }
-    if (event.environment !== 'test' || event.event !== 'transaction.updated') { response.status(200).end(); return; }
+    const expectedEnvironment = wompi.config.environment === 'sandbox' ? 'test'
+      : wompi.config.environment === 'production' ? 'prod' : null;
+    if (event.environment !== expectedEnvironment || expectedEnvironment === null) {
+      response.status(200).end(); return;
+    }
+    if (event.event === 'refund.updated' && wompi.refunds) {
+      const refund = event.data?.refund;
+      const refundId = refund?.v2_refund_id ?? refund?.refund_id;
+      if (typeof refundId === 'string') {
+        await wompi.refunds.recordWebhook({ id: refundId, transactionId: refund.transaction_id,
+          amountInCents: refund.amount_in_cents, currency: refund.currency, status: refund.status });
+      }
+      response.status(200).end(); return;
+    }
+    if (event.event !== 'transaction.updated') { response.status(200).end(); return; }
     const facts = normalizeWompiTransaction(event.data?.transaction);
     if (!facts?.id || !facts.reference || facts.amountInCents == null || facts.currency !== 'COP') { response.status(200).end(); return; }
     await booking.settlePayment({ provider: 'WOMPI', facts, eventId: typeof event.id === 'string' ? event.id : null });

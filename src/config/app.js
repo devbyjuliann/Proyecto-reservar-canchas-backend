@@ -1,5 +1,5 @@
 const ENVIRONMENTS = new Set(['development', 'test', 'production']);
-const APP_ENVIRONMENTS = new Set(['development', 'test', 'staging', 'production']);
+const APP_ENVIRONMENTS = new Set(['development', 'test', 'production']);
 
 function parsePort(value) {
   const port = Number(value ?? 3000);
@@ -54,7 +54,7 @@ export function loadAppConfig() {
     host,
     port: parsePort(process.env.PORT),
     frontendOrigin: parseFrontendOrigin(environment),
-    wompi: loadWompiConfig(appEnvironment),
+    wompi: loadWompiConfig(),
   });
 }
 
@@ -64,8 +64,8 @@ function parseAppEnvironment(nodeEnvironment) {
   if (!APP_ENVIRONMENTS.has(appEnvironment)) {
     throw new Error(`Unsupported APP_ENV: ${appEnvironment}`);
   }
-  if (nodeEnvironment === 'production' && !['staging', 'production'].includes(appEnvironment)) {
-    throw new Error('NODE_ENV=production requires APP_ENV=staging or APP_ENV=production');
+  if (nodeEnvironment === 'production' && appEnvironment !== 'production') {
+    throw new Error('NODE_ENV=production requires APP_ENV=production');
   }
   if (nodeEnvironment === 'test' && appEnvironment !== 'test') {
     throw new Error('NODE_ENV=test requires APP_ENV=test');
@@ -73,18 +73,33 @@ function parseAppEnvironment(nodeEnvironment) {
   return appEnvironment;
 }
 
-function loadWompiConfig(appEnvironment) {
+function loadWompiConfig() {
   const names = ['WOMPI_ENVIRONMENT', 'WOMPI_PUBLIC_KEY', 'WOMPI_PRIVATE_KEY', 'WOMPI_INTEGRITY_SECRET', 'WOMPI_EVENTS_SECRET'];
   const values = Object.fromEntries(names.map((name) => [name, process.env[name]?.trim() || undefined]));
   const present = Object.values(values).some(Boolean);
   if (!present) return Object.freeze({ enabled: false });
-  if (appEnvironment === 'production') throw new Error('Wompi production is not enabled');
-  if (values.WOMPI_ENVIRONMENT !== 'sandbox' || Object.values(values).some((value) => !value)) {
-    throw new Error('Wompi requires WOMPI_ENVIRONMENT=sandbox and all Wompi credentials');
+  if (!['sandbox', 'production'].includes(values.WOMPI_ENVIRONMENT)
+    || Object.values(values).some((value) => !value)) {
+    throw new Error('Wompi requires WOMPI_ENVIRONMENT=sandbox or production and all Wompi credentials');
   }
-  if (!values.WOMPI_PUBLIC_KEY.startsWith('pub_test_') || !values.WOMPI_PRIVATE_KEY.startsWith('prv_test_')) {
-    throw new Error('Wompi sandbox keys must use test prefixes');
+  const sandbox = values.WOMPI_ENVIRONMENT === 'sandbox';
+  const prefixes = sandbox ? ['pub_test_', 'prv_test_']
+    : ['pub_prod_', 'prv_prod_'];
+  if (!values.WOMPI_PUBLIC_KEY.startsWith(prefixes[0]) || !values.WOMPI_PRIVATE_KEY.startsWith(prefixes[1])) {
+    throw new Error(`Wompi ${values.WOMPI_ENVIRONMENT} keys must use matching prefixes`);
   }
+  if (!sandbox && (!values.WOMPI_INTEGRITY_SECRET.startsWith('prod_integrity_')
+    || !values.WOMPI_EVENTS_SECRET.startsWith('prod_events_'))) {
+    throw new Error('Wompi production secrets must use production prefixes');
+  }
+  const refundScenario = process.env.WOMPI_REFUND_TEST_SCENARIO?.trim() || null;
+  if (refundScenario && (!sandbox || !['approved', 'declined', 'error', 'cancelled'].includes(refundScenario))) {
+    throw new Error('Unsupported Wompi refund Sandbox scenario');
+  }
+  // Provider production remains disabled until refunds and reconciliation are validated.
+  if (!sandbox) throw new Error('Wompi production is not enabled');
   return Object.freeze({ enabled: true, publicKey: values.WOMPI_PUBLIC_KEY, privateKey: values.WOMPI_PRIVATE_KEY,
-    integritySecret: values.WOMPI_INTEGRITY_SECRET, eventsSecret: values.WOMPI_EVENTS_SECRET });
+    integritySecret: values.WOMPI_INTEGRITY_SECRET, eventsSecret: values.WOMPI_EVENTS_SECRET,
+    merchantId: process.env.WOMPI_MERCHANT_ID?.trim() || null, refundScenario,
+    environment: values.WOMPI_ENVIRONMENT });
 }

@@ -21,7 +21,13 @@ export function createBookingEmailNotifier({ sendEmail, frontendOrigin }) {
       `${booking.facility.name} · ${booking.court.name}\nMotivo: ${reason}\nPuedes priorizar una reprogramación o solicitar devolución completa cuando corresponda. No se ha procesado ninguna devolución.`, bookingsUrl),
     exceptionDecision: ({ email, booking, category, decision }) => deliverSimple(email,
       'Solicitud de excepción revisada', 'booking-exception-decision',
-      `${booking.facility.name} · ${booking.court.name}\n${category === 'MAL_CLIMA' ? 'Mal clima' : 'Fuerza mayor'}: ${decision === 'APROBADA' ? 'Aprobada. Puedes elegir otro horario.' : 'Rechazada.'}`, bookingsUrl),
+       `${booking.facility.name} · ${booking.court.name}\n${category === 'MAL_CLIMA' ? 'Mal clima' : 'Fuerza mayor'}: ${decision === 'APROBADA' ? 'Aprobada. Puedes elegir otro horario.' : 'Rechazada.'}`, bookingsUrl),
+    refundApproved: ({ booking, amountMinor, restoredMinor, reason }) => deliverSimple(booking.email,
+      'Reembolso procesado', 'booking-refund-approved',
+      `${booking.facility_name} · ${booking.court_name}\nReserva: ${new Intl.DateTimeFormat('es-CO', { dateStyle: 'long', timeZone: booking.booking_timezone }).format(new Date(booking.start_at))}`
+      + `\nDevuelto vía Wompi: $${new Intl.NumberFormat('es-CO').format(amountMinor / 100)} COP`
+      + (restoredMinor ? `\nSaldo a favor restaurado: $${new Intl.NumberFormat('es-CO').format(restoredMinor / 100)} COP` : '')
+      + `\nMotivo: ${reason === 'LATE_PAYMENT' ? 'Pago recibido fuera de plazo' : reason === 'OWNER_CANCELLATION' ? 'Cancelación del establecimiento' : 'Excepción aprobada'}.`, bookingsUrl),
   });
 
   async function deliverSimple(email, title, type, text, url) {

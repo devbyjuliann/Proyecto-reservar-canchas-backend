@@ -19,7 +19,7 @@ const REJECTION_CODES = Object.freeze({
   OUTSIDE_BOOKING_WINDOW: 'option_not_available',
 });
 
-export function createBookingModule({ adapter, clock, notifications, logger = console }) {
+export function createBookingModule({ adapter, clock, notifications, refunds, logger = console }) {
   if (!adapter) throw new TypeError('A booking adapter is required');
   if (typeof clock?.now !== 'function') throw new TypeError('A clock is required');
 
@@ -200,6 +200,10 @@ export function createBookingModule({ adapter, clock, notifications, logger = co
 
   async function settlePayment(input) {
     const result = await adapter.settlePayment(input);
+    if (result.refundPending && refunds) {
+      await refunds.ensureLatePayment(result.paymentId);
+      await refunds.processPending();
+    }
     if (result.confirmed && result.booking) {
       const presented = presentBooking(result.booking, toInstantString(clock.now()));
       await notifyBookingEvent('confirmation', { id: result.booking.userId, email: result.booking.customerEmail },
@@ -239,7 +243,10 @@ export function createBookingModule({ adapter, clock, notifications, logger = co
        depositAmountMinor: row.depositAmountMinor,
        amountPaidMinor: row.amountPaidMinor,
        paymentExpiresAt: row.paymentExpiresAt,
-       voluntaryRescheduleCount: row.voluntaryRescheduleCount,
+        voluntaryRescheduleCount: row.voluntaryRescheduleCount,
+        economicOutcome: row.economicOutcome,
+        economicResolution: row.economicResolution,
+        refundState: row.refundState,
     }));
     const last = rows[limit - 1];
     return { items, page: { nextCursor: rows.length > limit
@@ -288,19 +295,23 @@ export function createBookingModule({ adapter, clock, notifications, logger = co
     const result = await adapter.rescheduleBooking({ bookingId, userId: String(actor.id), request,
       idempotencyKey, requestHash,
       decide({ booking, now, exceptionApproved }) {
-        if (booking.status !== BOOKING_STATUS.CONFIRMED || booking.noShowAt
+        const ownerCancelled = booking.status === BOOKING_STATUS.CANCELLED
+          && booking.cancellationReason === 'CANCELLED_BY_OWNER'
+          && booking.economicOutcome === 'FULL_REFUND_OR_RESCHEDULE'
+          && !booking.economicResolution;
+        if (!(booking.status === BOOKING_STATUS.CONFIRMED || ownerCancelled) || booking.noShowAt
           || compareInstants(now, booking.endAt) >= 0) {
           throw bookingError('invalid_booking_state');
         }
         const cutoff = Temporal.Instant.from(booking.startAt)
           .subtract({ minutes: booking.cancellationMinMinutes ?? 120 }).toString();
-        if (compareInstants(now, cutoff) > 0 && !exceptionApproved) {
+        if (compareInstants(now, cutoff) > 0 && !exceptionApproved && !ownerCancelled) {
           throw bookingError('booking_cancellation_window_closed');
         }
-        if (!exceptionApproved && (booking.voluntaryRescheduleCount ?? 0) >= 1) {
+        if (!exceptionApproved && !ownerCancelled && (booking.voluntaryRescheduleCount ?? 0) >= 1) {
           throw bookingError('voluntary_reschedule_limit_reached');
         }
-        return compareInstants(now, cutoff) > 0;
+        return exceptionApproved || ownerCancelled;
       },
       evaluate({ context, now, durationMinutes }) {
         let decision;
@@ -737,6 +748,8 @@ function presentBooking(booking, now) {
     cancellationMinMinutes: booking.cancellationMinMinutes ?? 120,
     cancellationReason: booking.cancellationReason ?? null,
     economicOutcome: booking.economicOutcome ?? null,
+    economicResolution: booking.economicResolution ?? null,
+    refundState: booking.refundState ?? null,
     noShowAt: booking.noShowAt ?? null,
     paymentStatus: booking.paymentStatus ?? null,
     depositPercentage: booking.depositPercentage ?? null,

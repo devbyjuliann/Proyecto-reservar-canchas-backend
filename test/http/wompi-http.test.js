@@ -8,6 +8,7 @@ import { checkoutIntegrity, sha256 } from '../../src/modules/payments/wompi.js';
 
 const wompiConfig = {
   enabled: true,
+  environment: 'sandbox',
   publicKey: 'pub_test_public',
   privateKey: 'prv_test_private',
   integritySecret: 'integrity_secret',
@@ -30,7 +31,8 @@ function event({ id = 'evt_1', environment = 'test', eventName = 'transaction.up
   return value;
 }
 
-function createFixture({ settlePayment = async () => ({ confirmed: false }), findTransaction } = {}) {
+function createFixture({ settlePayment = async () => ({ confirmed: false }), findTransaction, refunds,
+  wompiEnvironment = 'sandbox' } = {}) {
   const booking = {
     async createPaymentAttempt() {
       return { amountMinor: 2700000, expiresAt: '2026-09-24T15:00:00.000Z' };
@@ -43,11 +45,28 @@ function createFixture({ settlePayment = async () => ({ confirmed: false }), fin
     environment: 'test',
     findActiveUserById: async (id) => (id === '7' ? { id: '7', roles: ['USUARIO'] } : null),
     logger: { error() {} },
-    wompi: { config: wompiConfig, provider: { findTransaction }, redirectUrl: 'http://localhost:5173/reservas/pago' },
+    wompi: { config: { ...wompiConfig, environment: wompiEnvironment }, provider: { findTransaction }, refunds,
+      redirectUrl: 'http://localhost:5173/reservas/pago' },
   });
 }
 
 describe('Wompi HTTP contract', () => {
+  it('settles only a signed Sandbox refund.updated event with exact provider facts', async () => {
+    const received = [];
+    const app = createFixture({ refunds: { recordWebhook: async (facts) => received.push(facts) } });
+    const refundEvent = event({ eventName: 'refund.updated' });
+    refundEvent.data = { refund: { refund_id: 'v2_ref_123', transaction_id: 'tx_1',
+      amount_in_cents: 2700000, currency: 'COP', status: 'APPROVED' } };
+    refundEvent.signature.properties = ['refund.refund_id', 'refund.status'];
+    refundEvent.signature.checksum = sha256('v2_ref_123APPROVED1700000000events_secret');
+    await request(app).post('/api/v1/webhooks/wompi').send(refundEvent).expect(200);
+    assert.deepEqual(received, [{ id: 'v2_ref_123', transactionId: 'tx_1',
+      amountInCents: 2700000, currency: 'COP', status: 'APPROVED' }]);
+    refundEvent.data.refund.amount_in_cents += 1;
+    refundEvent.signature.properties = ['refund.amount_in_cents'];
+    await request(app).post('/api/v1/webhooks/wompi').send(refundEvent).expect(401);
+    assert.equal(received.length, 1);
+  });
   it('returns the exact signed checkout configuration without server secrets', async () => {
     const app = createFixture();
     const response = await request(app)
@@ -106,6 +125,20 @@ describe('Wompi HTTP contract', () => {
     await request(app).post('/api/v1/webhooks/wompi').send(event({ eventName: 'transaction.created' })).expect(200);
     await request(app).post('/api/v1/webhooks/wompi').send(event({ environment: 'prod' })).expect(200);
     assert.equal(settled, 0);
+  });
+
+  it('accepts webhook environments by WOMPI_ENVIRONMENT, independently of app runtime', async () => {
+    const sandboxSettled = [];
+    const sandbox = createFixture({ settlePayment: async (input) => sandboxSettled.push(input) });
+    await request(sandbox).post('/api/v1/webhooks/wompi').send(event({ environment: 'prod' })).expect(200);
+    await request(sandbox).post('/api/v1/webhooks/wompi').send(event()).expect(200);
+    assert.equal(sandboxSettled.length, 1);
+    const productionSettled = [];
+    const production = createFixture({ wompiEnvironment: 'production',
+      settlePayment: async (input) => productionSettled.push(input) });
+    await request(production).post('/api/v1/webhooks/wompi').send(event()).expect(200);
+    await request(production).post('/api/v1/webhooks/wompi').send(event({ environment: 'prod' })).expect(200);
+    assert.equal(productionSettled.length, 1);
   });
 
   for (const status of ['DECLINED', 'ERROR']) {
