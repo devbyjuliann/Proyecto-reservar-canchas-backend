@@ -388,7 +388,8 @@ export function createMySqlBookingAdapter({ pool, isPublicCourt }) {
                 b.deposit_percentage_snapshot, b.deposit_amount_minor, b.amount_paid_minor,
                  b.payment_expires_at, b.voluntary_reschedule_count, b.economic_outcome,
                  b.economic_resolution, b.cancellation_reason,
-                 (SELECT CASE WHEN SUM(r.status = 'PENDING') > 0 THEN 'REFUND_PENDING'
+                 (SELECT CASE WHEN COUNT(r.id) = 0 THEN NULL
+                   WHEN SUM(r.status = 'PENDING') > 0 THEN 'REFUND_PENDING'
                    WHEN SUM(r.status = 'APPROVED') > 0 AND SUM(r.status IN ('ERROR', 'DECLINED', 'CANCELLED')) = 0 THEN 'REFUNDED'
                    ELSE 'REFUND_PENDING' END FROM payment_refunds r WHERE r.booking_id = b.id) AS refund_state,
               c.id AS court_id, c.name AS court_name,
@@ -2133,8 +2134,9 @@ function bookingSelect() {
                      b.payment_status, b.payment_expires_at, b.voluntary_reschedule_count, b.economic_resolution,
                   EXISTS (SELECT 1 FROM booking_exception_requests AS e
                     WHERE e.booking_id = b.id AND e.status = 'APROBADA' AND e.used_at IS NULL) AS exception_approved,
-                   (SELECT CASE WHEN SUM(r.status = 'PENDING') > 0 THEN 'REFUND_PENDING'
-                     WHEN SUM(r.status = 'APPROVED') > 0 AND SUM(r.status IN ('ERROR', 'DECLINED', 'CANCELLED')) = 0 THEN 'REFUNDED'
+                    (SELECT CASE WHEN COUNT(r.id) = 0 THEN NULL
+                      WHEN SUM(r.status = 'PENDING') > 0 THEN 'REFUND_PENDING'
+                      WHEN SUM(r.status = 'APPROVED') > 0 AND SUM(r.status IN ('ERROR', 'DECLINED', 'CANCELLED')) = 0 THEN 'REFUNDED'
                      ELSE 'REFUND_PENDING' END FROM payment_refunds r WHERE r.booking_id = b.id) AS refund_state,
                    c.id AS court_id, c.name AS court_name,
                   f.id AS facility_id, f.name AS facility_name,

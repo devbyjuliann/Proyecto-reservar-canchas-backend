@@ -145,14 +145,31 @@ describe('booking MySQL integration', { skip: !MYSQL_AVAILABLE, timeout: 30_000 
       WHERE booking_id = ?`, [`tx-${randomUUID()}`, created.booking.id]);
     const cancelled = await bookingModule.cancelOwnerBooking({ actor: { id: fixture.ownerIds[0], roles: ['PROPIETARIO'], ownerScope: true },
       bookingId: created.booking.id, reason: 'Daño de cancha', reasonCode: 'COURT_DAMAGE' });
-    assert.equal(cancelled.booking.economicOutcome, 'FULL_REFUND_OR_RESCHEDULE');
+    assert.deepEqual({ status: cancelled.booking.status, cancellationReason: cancelled.booking.cancellationReason,
+      economicOutcome: cancelled.booking.economicOutcome, economicResolution: cancelled.booking.economicResolution },
+    { status: 'CANCELADA', cancellationReason: 'CANCELLED_BY_OWNER',
+      economicOutcome: 'FULL_REFUND_OR_RESCHEDULE', economicResolution: null });
     let calls = 0;
     const refunds = createRefundEngine({ pool, provider: { createRefund: async (input) => {
       calls += 1; assert.equal(input.amountInCents, due);
-      return { id: 'refund-fixture-approved', status: 'APPROVED' };
+      return { id: 'refund-fixture-approved', status: 'PENDING' };
     } } });
-    await refunds.resolve({ bookingId: created.booking.id, userId: customer, choice: 'REFUND' });
-    await refunds.resolve({ bookingId: created.booking.id, userId: customer, choice: 'REFUND' });
+    const withRefunds = createBookingModule({ adapter, clock: createSystemClock(), refunds });
+    const app = createApp({ booking: withRefunds, environment: 'test', logger: { error() {} },
+      findActiveUserById: async (id) => id === customer ? { id: customer, roles: ['USUARIO'] } : null });
+    const listed = await request(app).get('/api/v1/me/bookings').set('X-User-Id', customer).expect(200);
+    const visible = listed.body.items.find((item) => item.id === created.booking.id);
+    assert.deepEqual({ status: visible.status, cancellationReason: visible.cancellationReason,
+      economicOutcome: visible.economicOutcome, economicResolution: visible.economicResolution,
+      refundState: visible.refundState, refundEligible: visible.refundEligible,
+      rescheduleEligible: visible.rescheduleEligible },
+    { status: 'CANCELADA', cancellationReason: 'CANCELLED_BY_OWNER',
+      economicOutcome: 'FULL_REFUND_OR_RESCHEDULE', economicResolution: null, refundState: null,
+      refundEligible: true, rescheduleEligible: true });
+    const [before] = await pool.execute('SELECT id FROM payment_refunds WHERE booking_id = ?', [created.booking.id]);
+    assert.equal(before.length, 0);
+    await request(app).post(`/api/v1/bookings/${created.booking.id}/resolution`).set('X-User-Id', customer)
+      .send({ choice: 'REFUND' }).expect(200, { resolution: 'REFUND', bookingId: created.booking.id });
     const [refundRows] = await pool.execute('SELECT id, amount_minor FROM payment_refunds WHERE booking_id = ?',
       [created.booking.id]);
     assert.equal(refundRows.length, 1);
@@ -160,7 +177,14 @@ describe('booking MySQL integration', { skip: !MYSQL_AVAILABLE, timeout: 30_000 
       transactionId: 'other-transaction', amountInCents: due + 1, currency: 'USD', status: 'APPROVED' });
     const [stillPending] = await pool.execute('SELECT status FROM payment_refunds WHERE id = ?', [refundRows[0].id]);
     assert.equal(stillPending[0].status, 'PENDING');
-    await Promise.all([refunds.processOne(String(refundRows[0].id)), refunds.processOne(String(refundRows[0].id))]);
+    const [paymentsForRefund] = await pool.execute('SELECT wompi_transaction_id FROM payments WHERE booking_id = ?',
+      [created.booking.id]);
+    await Promise.all([refunds.recordProviderResult({ refundId: String(refundRows[0].id),
+      id: 'refund-fixture-approved', transactionId: paymentsForRefund[0].wompi_transaction_id,
+      amountInCents: due, currency: 'COP', status: 'APPROVED' }), refunds.recordProviderResult({
+      refundId: String(refundRows[0].id), id: 'refund-fixture-approved',
+      transactionId: paymentsForRefund[0].wompi_transaction_id, amountInCents: due, currency: 'COP',
+      status: 'APPROVED' })]);
     assert.equal(calls, 1);
     assert.equal(Number(refundRows[0].amount_minor), due);
     const [ledger] = await pool.execute(`SELECT amount_minor FROM customer_credit_ledger WHERE booking_id = ?

@@ -30,6 +30,7 @@ export function createBookingModule({ adapter, clock, notifications, refunds, lo
     approveTestPayment,
     createPaymentAttempt,
     settlePayment,
+    resolveBooking,
     getLatestWompiTransaction,
     listOwnBookings,
     listOwnerBookings,
@@ -212,6 +213,13 @@ export function createBookingModule({ adapter, clock, notifications, refunds, lo
     return result;
   }
 
+  async function resolveBooking({ actor, bookingId, choice }) {
+    if (!refunds) throw bookingError('invalid_booking_state');
+    const result = await refunds.resolve({ bookingId, userId: String(actor.id), choice });
+    if (choice === 'REFUND') await refunds.processPending();
+    return result;
+  }
+
   async function listOwnerBookings({ actor, limit, cursor, ...input }) {
     assertOperationalActor(actor);
     if (!actor.ownerScope) throw bookingError('forbidden');
@@ -247,6 +255,8 @@ export function createBookingModule({ adapter, clock, notifications, refunds, lo
         economicOutcome: row.economicOutcome,
         economicResolution: row.economicResolution,
         refundState: row.refundState,
+        refundEligible: refundEligible(row),
+        rescheduleEligible: rescheduleEligible(row),
     }));
     const last = rows[limit - 1];
     return { items, page: { nextCursor: rows.length > limit
@@ -750,6 +760,8 @@ function presentBooking(booking, now) {
     economicOutcome: booking.economicOutcome ?? null,
     economicResolution: booking.economicResolution ?? null,
     refundState: booking.refundState ?? null,
+    refundEligible: refundEligible(booking),
+    rescheduleEligible: rescheduleEligible(booking),
     noShowAt: booking.noShowAt ?? null,
     paymentStatus: booking.paymentStatus ?? null,
     depositPercentage: booking.depositPercentage ?? null,
@@ -765,6 +777,21 @@ function presentBooking(booking, now) {
     createdAt: toInstantString(booking.createdAt),
     cancelledAt: booking.cancelledAt == null ? null : toInstantString(booking.cancelledAt),
   };
+}
+
+function refundEligible(booking) {
+  if (booking.economicResolution) return false;
+  return booking.status === BOOKING_STATUS.CANCELLED
+    && ((booking.cancellationReason === 'CANCELLED_BY_OWNER'
+      && booking.economicOutcome === 'FULL_REFUND_OR_RESCHEDULE')
+      || (booking.cancellationReason === 'CLIENTE_EXCEPCION'
+        && booking.economicOutcome === 'REFUND_ALLOWED'));
+}
+
+function rescheduleEligible(booking) {
+  return !booking.economicResolution && booking.status === BOOKING_STATUS.CANCELLED
+    && booking.cancellationReason === 'CANCELLED_BY_OWNER'
+    && booking.economicOutcome === 'FULL_REFUND_OR_RESCHEDULE';
 }
 
 function encodeCursor(value) {
